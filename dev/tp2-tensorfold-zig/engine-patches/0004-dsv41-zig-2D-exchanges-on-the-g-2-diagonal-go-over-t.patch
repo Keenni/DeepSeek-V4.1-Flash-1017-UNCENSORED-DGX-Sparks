@@ -1,0 +1,49 @@
+From 5727ac40c23e7259c034705e67267d242a90523d Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Tue, 20 Oct 2026 04:48:13 +0800
+Subject: [PATCH 4/4] dsv41 zig: 2D exchanges on the g^2 diagonal go over the
+ four-node all-gather (ring has no diagonal links); decode dense wo_b 2D path
+
+---
+ zig/src/families/dsv41/prompt2d.zig | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/dsv41/prompt2d.zig b/zig/src/families/dsv41/prompt2d.zig
+index 9faf03f..0b792db 100644
+--- a/zig/src/families/dsv41/prompt2d.zig
++++ b/zig/src/families/dsv41/prompt2d.zig
+@@ -197,7 +197,7 @@ pub const Two = struct {
+             }
+         }
+         const g: u32 = @intCast(t.r + 2 * t.p);
+-        try e.comm.exchange(mine, rows * width, t.peer, rows * width, .f16, g ^ 2, e.s);
++        try exchangeGather(t, e, mine, t.peer, rows * width, g ^ 2, 2);
+     }
+ 
+     /// moe_2d's parity experts after the main gate / up and the rest's: the packs exchanged with the column partner,
+@@ -247,6 +247,13 @@ pub const Two = struct {
+         }
+     }
+ 
++    /// A symmetric exchange with `peer` over the four-node all-gather (no p2p: the ring has no diagonal links).
++    /// `send` and `recv` are `count` elements of `esize`; both may be the same buffer.
++    fn exchangeGather(t: *const Two, e: *const prompt.Engine, send: u64, recv: u64, count: usize, peer: u32, esize: usize) !void {
++        const wmax = try t.allParts(e, send, count, .{ 1, 1 }, esize);
++        try e.ops.copyRows(e.s, t.parts + peer * count * wmax * esize, wmax * esize, recv, esize, esize, count);
++    }
++
+     /// cat_rank (Comm2D.cat_rank): `src` [n, w[p]] -> `dst` [n, w0 + w1]: this node's TP2 rank's whole width, pair 0's
+     /// part then pair 1's (from its column partner, the same rank of the other pair).
+     pub fn catRank(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize, esize: usize) !void {
+@@ -306,7 +313,7 @@ pub const Two = struct {
+         const g: u32 = @intCast(t.r + 2 * t.p);
+         try e.comm.exchange(src, mine, other, mine, .f32, g ^ 1, e.s);
+         try e.ops.add2Bf16(e.s, src, other, half, mine);
+-        try e.comm.exchange(half, mine, their, n * w[1 - t.p], .bf16, g ^ 2, e.s);
++        try exchangeGather(t, e, half, their, mine, g ^ 2, 2);
+         const row = (w[0] + w[1]) * 2;
+         for (0..2) |pg| {
+             const from = if (pg == t.p) half else their;
+-- 
+2.43.0
+

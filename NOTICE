@@ -1,0 +1,43 @@
+NOTICE
+======
+
+DeepSeek-V4.1-Flash-1017 (uncensored) — DGX Spark deployment notes
+Copyright (C) 2026 Keenni
+
+Files authored by us (docs/, dev/tp2-tensorfold-zig/, dev/tp4-tensorfold-zig/, the environment example)
+are licensed under the Apache License, Version 2.0 — see LICENSE.
+
+ONE EXCEPTION, and it matters:
+
+  dev/tp4-sglang/start-dsv41-tp4.sh is a MODIFIED COPY of start-tp4.sh from
+  MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks (commit 64b02de), which is licensed under the
+  GNU Affero General Public License v3.0, Copyright (C) 2026 zurih.
+  Accordingly, that file is distributed under AGPL-3.0, not Apache-2.0. If you redistribute it, or a
+  modified version of it, the AGPL-3.0 obligations travel with it. A copy of the licence text is at
+  https://www.gnu.org/licenses/agpl-3.0.txt and in THIRD_PARTY_NOTICES.md section 2.
+
+  dev/tp4-sglang/env.tp4.example and dev/tp4-sglang/flusher.sh are our own files (AGPL-3.0-free),
+  but they are meaningless without that launcher.
+
+redistributed_sources:
+
+  dev/tp2-tensorfold-zig/model/chat_template.jinja
+      from MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks (Apache-2.0), unmodified.
+
+  dev/tp2-tensorfold-zig/patches/0001..0004
+      git format-patch output from tonyd2wild's 2026-10-17 1017 TensorFold patches, applied to
+      bertholomus/TensorFold (Apache-2.0).
+
+  dev/tp2-tensorfold-zig/engine-patches/0001..0004
+      our own commits on top of bertholomus/TensorFold commit 5940208 (Apache-2.0 upstream).
+
+not redistributed here (fetched at build time by the operator):
+
+  TensorFold engine source and kernel kit  — bertholomus/TensorFold, branch deepseek-v41-zig-tp4
+  SGLang tree, boot.py, adapter/, Dockerfiles — MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks
+  b12x / b12x_next / RoCEnante kernels     — local-inference-lab, vendored by the above
+  switchless NCCL patch                     — alexellis
+  model weights                             — DeepSeek, MiaAI-Lab, dealignai, pqhaz (see CREDITS.md)
+  ExLlamaV3 quantisation format            — turboderp
+
+This repository contains no model weights, no engine binaries, and no container images.

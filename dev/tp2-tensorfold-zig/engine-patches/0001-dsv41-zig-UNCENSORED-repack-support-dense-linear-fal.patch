@@ -1,0 +1,614 @@
+From 69158a04d9a487025b147e8f7bf197f1dda659f3 Mon Sep 17 00:00:00 2001
+From: root <root@dgx01>
+Date: Mon, 19 Oct 2026 07:02:59 +0800
+Subject: [PATCH 1/4] =?UTF-8?q?dsv41=20zig:=20UNCENSORED=20repack=20suppor?=
+ =?UTF-8?q?t=20=E2=80=94=20dense=20linear=20fallback=20(Linear.dense+dn=20?=
+ =?UTF-8?q?cache=20entries+cublas=20linearDense,=20wo=5Fb=20plain=20layers?=
+ =?UTF-8?q?),=20F8=20safetensors=20dtypes=20for=20the=20engram=20shards,?=
+ =?UTF-8?q?=20shared-w2=20treble=20via=20extra=20shard;=20plus=20prior=20w?=
+ =?UTF-8?q?orking-tree=20state=20(rdma=20gid=20probe,=20seed/top=5Fk=20ser?=
+ =?UTF-8?q?ver=20patches)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ zig/src/core/safetensors.zig               |  7 +-
+ zig/src/cuda/aot.zig                       | 88 +++++++++++++++++++++-
+ zig/src/families/dsv41/checkpoint.zig      | 25 +++++-
+ zig/src/families/dsv41/cublas.zig          |  9 +++
+ zig/src/families/dsv41/layer_main.zig      |  2 +-
+ zig/src/families/dsv41/model.zig           |  4 +-
+ zig/src/families/dsv41/prompt.zig          | 18 ++++-
+ zig/src/families/dsv41/rank_cache_main.zig | 28 ++++++-
+ zig/src/families/dsv41/rdma.zig            |  6 ++
+ zig/src/families/dsv41/round.zig           | 15 +++-
+ zig/src/families/dsv41/weights.zig         | 42 ++++++++++-
+ zig/src/server/server.zig                  | 41 +++++++++-
+ 12 files changed, 263 insertions(+), 22 deletions(-)
+
+diff --git a/zig/src/core/safetensors.zig b/zig/src/core/safetensors.zig
+index ca7225f..93dd03c 100644
+--- a/zig/src/core/safetensors.zig
++++ b/zig/src/core/safetensors.zig
+@@ -17,10 +17,13 @@ pub const DType = enum {
+     u64,
+     i64,
+     f64,
++    f8_e4m3,
++    f8_e5m2,
++    f8_e8m0,
+ 
+     pub fn size(self: DType) usize {
+         return switch (self) {
+-            .bool, .u8, .i8 => 1,
++            .bool, .u8, .i8, .f8_e4m3, .f8_e5m2, .f8_e8m0 => 1,
+             .u16, .i16, .f16, .bf16 => 2,
+             .u32, .i32, .f32 => 4,
+             .u64, .i64, .f64 => 8,
+@@ -28,7 +31,7 @@ pub const DType = enum {
+     }
+ 
+     pub fn parse(text: []const u8) ?DType {
+-        const names = .{ .{ "BOOL", .bool }, .{ "U8", .u8 }, .{ "I8", .i8 }, .{ "U16", .u16 }, .{ "I16", .i16 }, .{ "F16", .f16 }, .{ "BF16", .bf16 }, .{ "U32", .u32 }, .{ "I32", .i32 }, .{ "F32", .f32 }, .{ "U64", .u64 }, .{ "I64", .i64 }, .{ "F64", .f64 } };
++        const names = .{ .{ "BOOL", .bool }, .{ "U8", .u8 }, .{ "I8", .i8 }, .{ "U16", .u16 }, .{ "I16", .i16 }, .{ "F16", .f16 }, .{ "BF16", .bf16 }, .{ "U32", .u32 }, .{ "I32", .i32 }, .{ "F32", .f32 }, .{ "U64", .u64 }, .{ "I64", .i64 }, .{ "F64", .f64 }, .{ "F8_E4M3", .f8_e4m3 }, .{ "F8_E5M2", .f8_e5m2 }, .{ "F8_E8M0", .f8_e8m0 } };
+         inline for (names) |n| if (std.mem.eql(u8, text, n[0])) return n[1];
+         return null;
+     }
+diff --git a/zig/src/cuda/aot.zig b/zig/src/cuda/aot.zig
+index ec4665d..1653227 100644
+--- a/zig/src/cuda/aot.zig
++++ b/zig/src/cuda/aot.zig
+@@ -55,12 +55,19 @@ pub fn cf(name: []const u8, v: f32) Const {
+     return .{ .name = name, .f32 = v };
+ }
+ 
+-const Variant = struct { spec: KernelJson, kernel: triton.Kernel };
++const Variant = struct {
++    spec: KernelJson,
++    kernel: triton.Kernel,
++    /// Said once on stderr when a launch first takes this variant in place of its own specialization.
++    told: std.atomic.Value(bool) = .init(false),
++};
+ 
+ pub const Set = struct {
+     parsed: std.json.Parsed(SetJson),
+     variants: []Variant,
+     gpa: std.mem.Allocator,
++    /// TF_AOT_WEAKEST=1: every launch takes its most general fitting variant (a gate of the fallback's exactness).
++    weakest: bool = false,
+ 
+     /// Loads every cubin listed in `dir`/aot.json into its own module.
+     pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, device: abi.Device, dir: []const u8) !Set {
+@@ -88,7 +95,8 @@ pub const Set = struct {
+             variants[n] = .{ .spec = k, .kernel = try triton.Kernel.load(d, device, cubin, meta, name_z) };
+             n += 1;
+         }
+-        return .{ .parsed = parsed, .variants = variants, .gpa = gpa };
++        const weakest = if (std.c.getenv("TF_AOT_WEAKEST")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
++        return .{ .parsed = parsed, .variants = variants, .gpa = gpa, .weakest = weakest };
+     }
+ 
+     pub fn deinit(self: *Set) void {
+@@ -98,11 +106,28 @@ pub const Set = struct {
+         self.* = undefined;
+     }
+ 
+-    /// The variant of `function` compiled for these constexprs and these arguments' specialization.
++    /// The variant of `function` compiled for these constexprs and these arguments' specialization; without one, the
++    /// fitting variant that assumes least less (fits: the same constexprs, each assumption it makes held by the
++    /// launch), named once on stderr.
+     pub fn find(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) !*const Variant {
+-        for (self.variants) |*v| {
++        if (!self.weakest) for (self.variants) |*v| {
+             if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
+             if (matches(v.spec, args, consts)) return v;
++        };
++        var best: ?*Variant = null;
++        var best_held: usize = 0;
++        for (self.variants) |*v| {
++            if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
++            const held = fits(v.spec, args, consts) orelse continue;
++            const better = if (self.weakest) held < best_held else held > best_held;
++            if (best == null or better) {
++                best = v;
++                best_held = held;
++            }
++        }
++        if (best) |v| {
++            if (!v.told.swap(true, .monotonic)) std.log.warn("{s}: a launch whose specialization no captured variant has runs variant {s} (assumes less)", .{ function, v.spec.hash[0..@min(12, v.spec.hash.len)] });
++            return v;
+         }
+         std.log.err("no captured Triton variant of {s} for this launch:", .{function});
+         for (args) |a| switch (a.value) {
+@@ -147,6 +172,61 @@ fn lookup(args: []const Arg, name: []const u8) ?Arg {
+     return null;
+ }
+ 
++/// Whether variant `k` may run this launch though compiled for a narrower one: the same constexprs, and every
++/// assumption it makes held by the launch (an argument it takes as 16-divisible is; an int it folded to 1 is 1). Null
++/// when it may not, else how many of the launch's own specializations it shares.
++fn fits(k: KernelJson, args: []const Arg, consts: []const Const) ?usize {
++    for (consts) |c| {
++        const got = k.consts.map.get(c.name) orelse return null;
++        if (c.int) |x| if (got.int == null or got.int.? != x) return null;
++        if (c.f32) |x| if (got.f32 == null or got.f32.? != @as(u32, @bitCast(x))) return null;
++    }
++    var held: usize = 0;
++    var runtime: usize = 0;
++    for (args) |a| {
++        const param = for (k.params) |p| {
++            if (std.mem.eql(u8, p.name, a.name)) break p;
++        } else null;
++        switch (a.value) {
++            .i32 => |x| {
++                if (param == null) {
++                    const got = k.consts.map.get(a.name) orelse return null;
++                    if (x != 1 or got.int == null or got.int.? != 1) return null;
++                    held += 1;
++                    continue;
++                }
++                const p = param.?;
++                if (!std.mem.eql(u8, p.type, "i32")) return null;
++                const d16 = !p.nospec and x != 1 and @mod(x, 16) == 0;
++                if (p.div16 and !d16) return null;
++                if (p.div16 == d16 and (p.nospec or x != 1)) held += 1;
++            },
++            .ptr => |x| {
++                const p = param orelse return null;
++                if (!std.mem.eql(u8, p.type, x.ty)) return null;
++                const d16 = x.addr % 16 == 0;
++                if (p.div16 and !d16) return null;
++                if (p.div16 == d16) held += 1;
++            },
++            .f32 => {
++                const p = param orelse return null;
++                if (!std.mem.eql(u8, p.type, "fp32")) return null;
++                held += 1;
++            },
++            .u64 => |x| {
++                const p = param orelse return null;
++                if (!std.mem.eql(u8, p.type, "u64")) return null;
++                const d16 = x % 16 == 0;
++                if (p.div16 and !d16) return null;
++                if (p.div16 == d16) held += 1;
++            },
++        }
++        runtime += 1;
++    }
++    if (runtime != k.params.len) return null;
++    return held;
++}
++
+ fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
+     for (consts) |c| {
+         const got = k.consts.map.get(c.name) orelse return false;
+diff --git a/zig/src/families/dsv41/checkpoint.zig b/zig/src/families/dsv41/checkpoint.zig
+index d236aa4..840c3fc 100644
+--- a/zig/src/families/dsv41/checkpoint.zig
++++ b/zig/src/families/dsv41/checkpoint.zig
+@@ -119,7 +119,7 @@ const Source = struct { t: st.Tensor, name: []const u8 };
+ 
+ fn source(sh: *const Shards, k: Key, buf: []u8) !Source {
+     const name = if (!k.exl3) k.name else blk: {
+-        const tail = if (std.mem.eql(u8, k.part, "tr")) "trellis" else if (std.mem.eql(u8, k.part, "suh")) "suh" else if (std.mem.eql(u8, k.part, "svh")) "svh" else return error.BadKey;
++        const tail = if (std.mem.eql(u8, k.part, "tr")) "trellis" else if (std.mem.eql(u8, k.part, "suh")) "suh" else if (std.mem.eql(u8, k.part, "svh")) "svh" else if (std.mem.eql(u8, k.part, "dn")) "weight" else return error.BadKey;
+         break :blk try std.fmt.bufPrint(buf, "{s}.{s}", .{ k.name, tail });
+     };
+     return .{ .t = sh.get(name) orelse return error.MissingTensor, .name = name };
+@@ -136,6 +136,10 @@ pub fn describe(sh: *const Shards, key: []const u8) !Slice {
+         if (std.mem.eql(u8, k.part, "tr")) {
+             if (k.rows) |r| out.shape[0] = (r[1] - r[0]) / 16;
+             if (k.cols) |c| out.shape[1] = (c[1] - c[0]) / 16;
++        } else if (std.mem.eql(u8, k.part, "dn")) {
++            // the plain weight [N, K] as the dense gemm's B: the cols cut of N, the rows cut of K
++            if (k.cols) |c| out.shape[0] = c[1] - c[0];
++            if (k.rows) |r| out.shape[1] = r[1] - r[0];
+         } else if (std.mem.eql(u8, k.part, "suh")) {
+             if (k.rows) |r| out.shape[0] = r[1] - r[0];
+         } else if (k.cols) |c| out.shape[0] = c[1] - c[0];
+@@ -149,6 +153,15 @@ pub fn describe(sh: *const Shards, key: []const u8) !Slice {
+ /// Where `key`'s source tensor lies in its shard (a reader that takes the whole tensor in one read, then readFrom).
+ pub const Span = struct { file: *const st.File, offset: usize, len: usize };
+ 
++/// Whether `key` resolves in the shards at all (the loader's dense fallback probe).
++pub fn has(sh: *const Shards, key: []const u8) bool {
++    var buf: [256]u8 = undefined;
++    const k = Key.parse(key) catch return false;
++    const s = source(sh, k, &buf) catch return false;
++    _ = s;
++    return true;
++}
++
+ pub fn span(sh: *const Shards, key: []const u8) !Span {
+     const k = try Key.parse(key);
+     var buf: [256]u8 = undefined;
+@@ -182,6 +195,16 @@ pub fn readFrom(sh: *const Shards, key: []const u8, bytes: ?[]const u8, out: []u
+         return error.UnsupportedConversion;
+     }
+     const es = (try dtypeOf(t.dtype)).size();
++    if (std.mem.eql(u8, k.part, "dn")) {
++        // the plain weight's rows (of N) at the cols cut, each row's cols cut of K, contiguous [n, k] out
++        const n0 = if (k.cols) |c| c[0] else 0;
++        const nl = if (k.cols) |c| c[1] - c[0] else t.dim(0);
++        const k0 = if (k.rows) |r| r[0] else 0;
++        const kl = if (k.rows) |r| r[1] - r[0] else t.dim(1);
++        const row = t.dim(1) * es;
++        for (0..nl) |i| @memcpy(out[i * kl * es ..][0 .. kl * es], t.bytes[(n0 + i) * row + k0 * es ..][0 .. kl * es]);
++        return;
++    }
+     if (std.mem.eql(u8, k.part, "tr")) {
+         const row = t.dim(1) * t.dim(2) * es; // one K tile row: every N tile's words
+         const k0 = if (k.rows) |r| r[0] / 16 else 0;
+diff --git a/zig/src/families/dsv41/cublas.zig b/zig/src/families/dsv41/cublas.zig
+index 0411372..d0b81d1 100644
+--- a/zig/src/families/dsv41/cublas.zig
++++ b/zig/src/families/dsv41/cublas.zig
+@@ -63,6 +63,15 @@ pub const Blas = struct {
+         }
+     }
+ 
++    /// nn.Linear without a bias of x bf16 [rows, ldx] and w bf16 [n, k] (the dense fallback's contiguous block):
++    /// out fp32 or bf16 [rows, ldc], the scales-free plain gemm the exl3 path's rot / suh / svh stand in for.
++    pub fn linearDense(b: *const Blas, x: u64, ldx: usize, w: u64, out: u64, ldc: usize, rows: usize, k: usize, n: usize, f32_out: bool) Error!void {
++        const one: f32 = 1;
++        const zero: f32 = 0;
++        const ctype: c_int = if (f32_out) 0 else 14; // CUDA_R_32F / CUDA_R_16BF
++        try b.check(b.api.cublasGemmEx(b.handle, .t, .n, @intCast(n), @intCast(rows), @intCast(k), &one, w, 14, @intCast(k), x, 14, @intCast(ldx), &zero, out, ctype, @intCast(ldc), 68, 99));
++    }
++
+     /// nn.Linear without a bias of x bf16 [rows, k] and w bf16 [n, k]: out bf16 [rows, n], as torch issues it
+     /// (cublasGemmEx: transa T, transb N, m = n, n = rows, lda = ldb = k, ldc = n, fp32 alpha 1 and beta 0, bf16
+     /// operands, COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP; the recording's cuBLAS log for the vision MLP).
+diff --git a/zig/src/families/dsv41/layer_main.zig b/zig/src/families/dsv41/layer_main.zig
+index d011ebc..eef6a9a 100644
+--- a/zig/src/families/dsv41/layer_main.zig
++++ b/zig/src/families/dsv41/layer_main.zig
+@@ -422,7 +422,7 @@ pub fn main(init: std.process.Init) !u8 {
+         var devices: std.ArrayList([]const u8) = .empty;
+         var dit = std.mem.splitScalar(u8, rdma_devices.?, ',');
+         while (dit.next()) |d| try devices.append(a, d);
+-        rdma_rings = try dsv41.ring2d.Rings.open(gpa, &driver, try dsv41.rdma.Kernels.load(rdma_mod.?), devices.items, rank, .{ .max_bytes = 4456448, .gid_index = 5 }, &comm, stream);
++        rdma_rings = try dsv41.ring2d.Rings.open(gpa, &driver, try dsv41.rdma.Kernels.load(rdma_mod.?), devices.items, rank, .{ .max_bytes = 4456448, .gid_index = dsv41.rdma.rdmaGid() }, &comm, stream);
+         two.?.rings = &rdma_rings.?;
+     }
+     var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .lin = &lg, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = sp.world, .plain = rope, .compressed = rope_c, .two = if (two) |*t| t else null };
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index b14ab80..efdb1d0 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -296,7 +296,7 @@ pub const Model = struct {
+                 var devices: std.ArrayList([]const u8) = .empty;
+                 var dit = std.mem.splitScalar(u8, devs, ',');
+                 while (dit.next()) |x| try devices.append(a, x);
+-                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = 5 }, &m.comm, m.stream);
++                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = rdma.rdmaGid() }, &m.comm, m.stream);
+                 m.two.?.rings = &m.rdma_rings.?;
+             }
+         }
+@@ -421,7 +421,7 @@ pub const Model = struct {
+     /// connected, and started once both are (an all-gather as the barrier).
+     pub fn openRing(gpa: std.mem.Allocator, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, rank: u32, comm: *const comm_mod.Comm, stream: cuda.Stream) !*rdma.Ring {
+         if (comm.world != 2) return error.NotTwoRanks;
+-        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = 5 });
++        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = rdma.rdmaGid() });
+         errdefer r.destroy(gpa);
+         const per = @sizeOf(rdma.Info);
+         const mine = [2]rdma.Info{ r.info(0), r.info(1) };
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index 1fe58df..495996a 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -212,6 +212,7 @@ pub const Chunk = struct {
+     wl: u64 = 0, // fp32 [cap, index_heads]
+     iw: u64 = 0, // bf16 [cap, index_heads]: the heads' weights
+     vis: u64 = 0, // int64 [cap]: compressed entries a row sees
++    vis_blk: u64 = 0, // int64 [cap]: an indexer row block's vis when its view of vis is not 16-byte aligned
+     keys: u64 = 0, // int64 [rows of a block, n_comp]: at most key_elems
+     score: u64 = 0, // fp32 [rows of a block, n_comp]: the candidate pool's layers' index scores
+     tmax: u64 = 0, // int64 [rows of a block, cdiv(n_comp, 64)]
+@@ -340,6 +341,7 @@ pub const Chunk = struct {
+             ch.wl = try a.take(cap * c.index_heads * 4);
+             ch.iw = try a.take(cap * c.index_heads * 2);
+             ch.vis = try a.take(cap * 8);
++            ch.vis_blk = try a.take(cap * 8);
+             // the indexer's row blocks keep rows * n_comp under 2^24 (model.py rb), so their keys under key_elems
+             const ke: usize = @min(cap * ch.max_comp, key_elems); // (typed: @min with a comptime bound narrows)
+             ch.keys = try a.take(ke * 8);
+@@ -487,6 +489,7 @@ fn layerLinears(e: *const Engine, ch: *Chunk, a: *Arena, lay: weights.Layer, max
+ fn addLinear(e: *const Engine, ch: *Chunk, a: *Arena, l: weights.Linear, max_gk: *usize, max_gz: *usize) !void {
+     max_gk.* = @max(max_gk.*, l.k);
+     max_gz.* = @max(max_gz.*, exl3_linear.zFloats(&[_]weights.Linear{l}, 128));
++    if (l.dense != 0) return; // a dense linear's cublas gemm takes no rotated rows or split-K counters
+     if (ch.n_counters == ch.counters.len) return error.TooManyLinears;
+     const bytes = 8 * (l.n / 128) * 4;
+     const ptr = try a.take(bytes);
+@@ -698,6 +701,7 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
+ 
+ /// mm(layer, x, out_dtype) of m rows: the prompt GEMM beyond 128 rows, the layer's own group (GROUPED) up to 128.
+ fn mmRows(e: *const Engine, ch: *const Chunk, m: usize, l: weights.Linear, x: u64, ldx: usize, out: u64, out_type: tri_markov.OutType, os: usize) !void {
++    if (l.dense != 0) return e.blas.linearDense(x, ldx, l.dense, out, os, m, l.k, l.n, out_type == .fp32);
+     if (m > 128) return exl3_prefill.matmul(e.pf, e.t, ch.ws, l, x, .bf16, ldx, out, out_type, os, m);
+     const dt: exl3_linear.DType = switch (out_type) {
+         .bf16 => .bf16,
+@@ -902,6 +906,14 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared,
+     try tri_attn.fp4Store(e.t, ch.lat2, hd, cs.comp_codes[li], cs.comp_scales[li], ch.groups, full, hd, 16, true);
+ }
+ 
++/// vis[r0..][0..m] at a 16-byte-aligned address, as the kit's indexer variants take VIS: the view, else a copy.
++fn visBlock(e: *const Engine, ch: *const Chunk, r0: usize, m: usize) !u64 {
++    const view = ch.vis + r0 * 8;
++    if (view % 16 == 0) return view;
++    try e.ops.copyRows(e.s, view, m * 8, ch.vis_blk, m * 8, m * 8, 1);
++    return ch.vis_blk;
++}
++
+ /// The indexer of a layer with index queries (switch "prompt_keys", layers before the candidate source): the
+ /// queries (idx_wq_b of q's latent, RoPE, fp4_qd's bytes), the heads' weights (x.float() @ idx_proj.t() through cuBLAS,
+ /// to bf16, times idx_dim ** -0.5 * idx_heads ** -0.5), each row's int64 keys of the kv source's index keys and the
+@@ -950,12 +962,12 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
+     const pk = @min(c.candidate_blocks, nbk);
+     var r0: usize = 0;
+     while (r0 < n) : (r0 += rb) {
+-        // the block's rows: iq[r0:r1], wts[r0:r1] and vis[r0:r1] as views (their offsets the served pointers'), its
+-        // selection into cidx[r0:r1]
++        // the block's rows: iq[r0:r1] and wts[r0:r1] as views (their offsets the served pointers'), vis[r0:r1] at a
++        // 16-byte-aligned address (visBlock), its selection into cidx[r0:r1]
+         const m = @min(n, r0 + rb) - r0;
+         const q = ch.iq4 + r0 * ih * id * 2;
+         const wb = ch.iw + r0 * ih * 2;
+-        const vr = ch.vis + r0 * 8;
++        const vr = try visBlock(e, ch, r0, m);
+         const out = ch.cidx + r0 * kk * 8;
+         if (keyed) {
+             try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.keys, null, true, ch.tmax, false, m, ih, id);
+diff --git a/zig/src/families/dsv41/rank_cache_main.zig b/zig/src/families/dsv41/rank_cache_main.zig
+index 879be3c..f5f47ba 100644
+--- a/zig/src/families/dsv41/rank_cache_main.zig
++++ b/zig/src/families/dsv41/rank_cache_main.zig
+@@ -49,10 +49,36 @@ pub fn main(init: std.process.Init) !u8 {
+     // four ranks: the exact 2D split (node g = TP2 rank g % 2 of pair g / 2); the file is still rank g of 4
+     const split: dsv41.plan.Split = if (world == 4) .{ .rank = rank % 2, .world = 2, .pair = rank / 2, .parity = parity } else .{ .rank = rank, .world = world };
+     const cfg = try dsv41.Config.read(a, io, args[1]);
+-    const want = try dsv41.plan.wants(a, cfg, split, dspark);
++    const want0 = try dsv41.plan.wants(a, cfg, split, dspark);
+     var sh = try dsv41.checkpoint.Shards.open(gpa, io, args[1]);
+     defer sh.close(io);
+ 
++    // dense linears: an exl3 triple whose trellis the checkpoint keeps as a plain `.weight` instead (the repacked
++    // UNCENSORED packs' full precision attn.wo_b) becomes one `dn` entry: the sliced bf16 block the loader's
++    // cublas gemm takes; the triple's suh / svh a dense linear has none of
++    var dense: std.ArrayList(dsv41.plan.Want) = .empty;
++    var wi: usize = 0;
++    while (wi < want0.len) : (wi += 1) {
++        const x = want0[wi];
++        var is_dense = false;
++        if (std.mem.endsWith(u8, x.key, "|tr")) {
++            if (dsv41.checkpoint.describe(&sh, x.key)) |_| {} else |err| switch (err) {
++                error.MissingTensor => {
++                    const dn_key = try std.fmt.allocPrint(a, "{s}dn", .{x.key[0 .. x.key.len - 2]});
++                    _ = dsv41.checkpoint.describe(&sh, dn_key) catch |derr| {
++                        std.debug.print("{s}: {t}\n", .{ dn_key, derr });
++                        return 1;
++                    };
++                    try dense.append(a, .{ .key = dn_key });
++                    is_dense = true;
++                },
++                else => return err,
++            }
++        }
++        if (!is_dense) try dense.append(a, x) else wi += 2; // the triple's suh / svh
++    }
++    const want = dense.items;
++
+     // every entry's layout first, and from the layouts the index: a missing tensor or a layout the split does not
+     // expect stops before a byte is written
+     const slices = try a.alloc(dsv41.checkpoint.Slice, want.len);
+diff --git a/zig/src/families/dsv41/rdma.zig b/zig/src/families/dsv41/rdma.zig
+index dfc06a9..5dacaf9 100644
+--- a/zig/src/families/dsv41/rdma.zig
++++ b/zig/src/families/dsv41/rdma.zig
+@@ -28,6 +28,12 @@ const host_register_devicemap = 0x02;
+ 
+ pub const Error = error{ VerbsFailed, PostFailed, BadInfo, TooLarge, Failed, NoHostRegister } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
+ 
++/// TF_RDMA_GID: the RDMA rings' source GID index (the port's RoCE v2 IPv4 entry); 5 as served on the recipe authors' nodes.
++pub fn rdmaGid() u8 {
++    const v = std.c.getenv("TF_RDMA_GID") orelse return 5;
++    return std.fmt.parseInt(u8, std.mem.span(v), 10) catch 5;
++}
++
+ /// The Python build's switches, with their defaults (TF_RDMA_SLOTS, TF_RDMA_STAGE_BLOCKS, ..., TF_RDMA_PDL as served).
+ pub const Settings = struct {
+     slots: u32 = 4,
+diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
+index c674aa0..43f8a85 100644
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -740,17 +740,23 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches,
+     var col: usize = 0;
+     var off: usize = 0;
+     for (lay.wo_a[0..lay.groups], 0..) |wo, gi| {
+-        const rot: exl3_linear.RotOut = if (e.two) |tw| round2d.woRot(tw, lay, col) else .{ .suh = lay.wo_b.suh, .xh = rd.xb, .ldr = @intCast(lay.wo_b.k), .off = @intCast(col) };
++        // a dense wo_b takes its input unrotated (no suh): the groups' plain outputs already tile u
++        const rot: ?exl3_linear.RotOut = if (lay.wo_b.dense != 0) null else if (e.two) |tw| round2d.woRot(tw, lay, col) else .{ .suh = lay.wo_b.suh, .xh = rd.xb, .ldr = @intCast(lay.wo_b.k), .off = @intCast(col) };
+         calls[gi] = .{ .layer = wo, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xhwo + off * 2, .y = rd.u + col * 2, .ldy = @intCast(uw), .y_dtype = .bf16, .counters = 0, .rot = rot };
+         col += wo.n;
+         off += R * wo.k;
+     }
+     try prompt.groupedRotated(e, ch, R, calls[0..lay.groups]);
+     try rd.mark(e, .a_woa);
++    if (e.two != null and lay.wo_b.dense != 0) return notPorted(@src()); // 2D: the dense gemm's cross-pair input exchange
+     if (e.two) |tw| try round2d.woExchange(tw, e, rd.xb, R); // 2D: the column partner's half of wo_b's input rows
+     try rd.mark(e, .a_x);
+-    var cb_call = [_]exl3_linear.Call{.{ .layer = lay.wo_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xb, .y = rd.pa, .ldy = @intCast(lay.wo_b.n), .y_dtype = .f32, .counters = 0 }};
+-    try prompt.groupedRotated(e, ch, R, &cb_call);
++    if (lay.wo_b.dense != 0) {
++        try e.blas.linearDense(rd.u, uw, lay.wo_b.dense, rd.pa, @as(usize, @intCast(lay.wo_b.n)), R, lay.wo_b.k, lay.wo_b.n, true);
++    } else {
++        var cb_call = [_]exl3_linear.Call{.{ .layer = lay.wo_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xb, .y = rd.pa, .ldy = @intCast(lay.wo_b.n), .y_dtype = .f32, .counters = 0 }};
++        try prompt.groupedRotated(e, ch, R, &cb_call);
++    }
+     // the prefetch behind wo_b: the ffn mix's weights, the router, the shared expert's gate
+     if (l2_skip & 2 == 0) try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up, lay.experts.shared_down }, l2_mb[1] << 20);
+ }
+@@ -796,8 +802,9 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
+     } else try rd.prefetch(e, &.{linearBytes(e.w.head)}, l2_mb[2] << 20);
+ }
+ 
+-/// An EXL3 linear's words: their first byte and length (k * n values of k2 / 2 bits).
++/// An EXL3 linear's words: their first byte and length (k * n values of k2 / 2 bits). A dense linear: its bf16 block.
+ fn linearBytes(l: weights.Linear) [2]u64 {
++    if (l.dense != 0) return .{ l.dense, @as(u64, l.k) * l.n * 2 };
+     return .{ l.words, @as(u64, l.k) * l.n * l.k2 / 16 };
+ }
+ 
+diff --git a/zig/src/families/dsv41/weights.zig b/zig/src/families/dsv41/weights.zig
+index 2f11271..f9e7679 100644
+--- a/zig/src/families/dsv41/weights.zig
++++ b/zig/src/families/dsv41/weights.zig
+@@ -11,7 +11,7 @@ const checkpoint = @import("checkpoint.zig");
+ /// An EXL3 linear in the strips layout: words int32 [N/128, K/16, 8, 8 * bits], fp16 suh [K] and svh [N].
+ /// plan_n: the N its decode plan is made for, when not n: a 2D node's column part of a TP2 slice keeps that slice's
+ /// plan (linear.py pinned plans), so its columns sum in the slice's K order.
+-pub const Linear = struct { words: u64, suh: u64, svh: u64, k: u32, n: u32, k2: u32, plan_n: u32 = 0 };
++pub const Linear = struct { words: u64, suh: u64, svh: u64, k: u32, n: u32, k2: u32, plan_n: u32 = 0, dense: u64 = 0 };
+ 
+ /// A layer's routed experts and its shared expert (the last entry), as exl3_experts.prepare lays them out. On a 2D node
+ /// (exl3/experts2d.py prepare) gate / up hold its intermediate blocks (width of the half's down_k) and down its
+@@ -143,6 +143,14 @@ pub const Source = union(enum) {
+             .shards => |sh| try checkpoint.read(sh, key, out),
+         }
+     }
++
++    /// Whether `key` is there at all (the dense fallback's probe; no read).
++    pub fn has(s: Source, key: []const u8) bool {
++        return switch (s) {
++            .cache => |c| c.index.get(key) != null,
++            .shards => |sh| checkpoint.has(sh, key),
++        };
++    }
+ };
+ 
+ /// Trellis int16 [kt, nt, w16] as int32 words [nt / 8, kt, 8, w16 / 2] (linear.py strips): each 128-column block's
+@@ -185,10 +193,12 @@ const Loader = struct {
+         return L.upload(tensor, try L.entry(try plan.plainKey(&kb, tensor, dtype)));
+     }
+ 
+-    /// linear(prefix, cols, rows): Exl3Linear.from_tensors in strips.
++    /// linear(prefix, cols, rows): Exl3Linear.from_tensors in strips; a linear the checkpoint keeps plain (no trellis,
++    /// a `.weight` only) as the dense fallback: the bf16 [n, k] block a cublas gemm takes (Linear.dense).
+     fn linear(L: *Loader, prefix: []const u8, cols: ?[2]usize, rows: ?[2]usize) !Linear {
+         var kb: [256]u8 = undefined;
+         var nb: [256]u8 = undefined;
++        if (!L.src.has(try plan.partKey(&kb, prefix, cols, rows, "tr"))) return L.denseLinear(prefix, cols, rows);
+         const tr = try L.entry(try plan.partKey(&kb, prefix, cols, rows, "tr"));
+         const t = try L.shape(try plan.partKey(&kb, prefix, cols, rows, "tr"));
+         const kt = t[0];
+@@ -203,6 +213,34 @@ const Loader = struct {
+         return .{ .words = words, .suh = suh, .svh = svh, .k = @intCast(kt * 16), .n = @intCast(nt * 16), .k2 = @intCast(w16 / 8) };
+     }
+ 
++    /// The dense fallback: the plain weight's [n, k] block (the `dn` entry the rank cache keeps, the checkpoint's
++    /// `.weight` sliced), uploaded as `{prefix}.dense` for the cublas gemm the call sites take.
++    fn denseLinear(L: *Loader, prefix: []const u8, cols: ?[2]usize, rows: ?[2]usize) !Linear {
++        var kb: [256]u8 = undefined;
++        var nb: [256]u8 = undefined;
++        const key = try plan.partKey(&kb, prefix, cols, rows, "dn");
++        const d = try L.shape2(key);
++        const bytes = try L.entry(key);
++        const ptr = try L.upload(try std.fmt.bufPrint(&nb, "{s}.dense", .{prefix}), bytes);
++        return .{ .words = 0, .suh = 0, .svh = 0, .k = @intCast(d[1]), .n = @intCast(d[0]), .k2 = 0, .dense = ptr };
++    }
++
++    /// A dense entry's [n, k].
++    fn shape2(L: *Loader, key: []const u8) ![2]usize {
++        return switch (L.src) {
++            .cache => |c| blk: {
++                const e = c.index.get(key) orelse return error.MissingEntry;
++                if (e.rank != 2) return error.UnexpectedTensor;
++                break :blk .{ e.shape[0], e.shape[1] };
++            },
++            .shards => |sh| blk: {
++                const s = try checkpoint.describe(sh, key);
++                if (s.rank != 2) return error.UnexpectedTensor;
++                break :blk .{ s.shape[0], s.shape[1] };
++            },
++        };
++    }
++
+     /// A trellis entry's [kt, nt, w16].
+     fn shape(L: *Loader, key: []const u8) ![3]usize {
+         return switch (L.src) {
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 29a5382..8d93c8c 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -22,6 +22,10 @@ const Value = json.Value;
+ const Cx = errors.Cx;
+ const Allocator = std.mem.Allocator;
+ 
++/// Requests so far that drew a random seed (TF_SEED_RANDOM), and the second of the last top_k warning.
++var seed_counter: std.atomic.Value(u64) = .init(0);
++var clamp_warned_s: std.atomic.Value(i64) = .init(-60);
++
+ /// auto compacts near the window. fraction compacts past that share of it.
+ pub const CompactAt = union(enum) { auto, fraction: f64 };
+ 
+@@ -135,6 +139,39 @@ pub const Server = struct {
+         return null;
+     }
+ 
++    /// TF_SEED_RANDOM=1: the value mixed into the salt of a request that names no seed, so identical requests sample
++    /// differently (off: the seed is keyed to the prompt alone, as before). A request that sends `seed` keeps it exactly.
++    fn seedMix(srv: *const Server) i64 {
++        const v = std.c.getenv("TF_SEED_RANDOM") orelse return 0;
++        if (!std.mem.eql(u8, std.mem.span(v), "1")) return 0;
++        const ns: u64 = @truncate(@as(u96, @bitCast(std.Io.Clock.real.now(srv.io).toNanoseconds())));
++        const n = seed_counter.fetchAdd(1, .monotonic);
++        return @bitCast((ns ^ (n *% 0x9E3779B97F4A7C15)) *% 0xBF58476D1CE4E5B9);
++    }
++
++    /// TF_TOP_K_MAX=N: the largest top_k the engine's sampler takes (DeepSeek-V4.1: 56). A request top_k of 0 or below
++    /// (vLLM's "off") means the server default, and one above N is cut to N, with a warning at most once a minute.
++    fn topKFor(srv: *const Server, asked: i64) i64 {
++        const v = std.c.getenv("TF_TOP_K_MAX") orelse return asked;
++        const max = std.fmt.parseInt(i64, std.mem.span(v), 10) catch return asked;
++        if (max <= 0) return asked;
++        var k = asked;
++        if (k <= 0) {
++            k = 20;
++            if (srv.config.default_sampling) |d| if (d.get("top_k")) |dk| if (dk.int64()) |n| if (n > 0) {
++                k = n;
++            };
++        }
++        if (k > max) {
++            const now_s: i64 = @intCast(@divFloor(clock.nowNs(srv.io), std.time.ns_per_s));
++            const last = clamp_warned_s.load(.monotonic);
++            if (now_s - last >= 60 and clamp_warned_s.cmpxchgStrong(last, now_s, .monotonic, .monotonic) == null)
++                log.line("warning: top_k {d} is above this engine's sampler limit; using {d} (at most one warning a minute)", .{ k, max });
++            k = max;
++        }
++        return k;
++    }
++
+     /// ``_resolve_sampling``: omitted or null fields keep the defaults; an omitted seed is keyed to the prompt.
+     pub fn resolveSampling(srv: *Server, cx: *Cx, f: Value, temperature: f64, prompt_ids: []const u32) errors.Refused!?api.Sampling {
+         _ = temperature; // the request's own temperature field decides, as in the Python server
+@@ -143,11 +180,11 @@ pub const Server = struct {
+         try merge(options, cx, try fields.parseNumbers(cx, f));
+         const temp = number(options.get("temperature")) orelse 0;
+         if (temp <= 0) return null;
+-        const seed: u64 = if (options.get("seed")) |s| seedBits(s) else api.seedFor(prompt_ids, srv.config.seed_salt);
++        const seed: u64 = if (options.get("seed")) |s| seedBits(s) else api.seedFor(prompt_ids, srv.config.seed_salt +% srv.seedMix());
+         return .{
+             .seed = seed,
+             .temperature = @floatCast(temp),
+-            .top_k = @intCast(@min(@max(0, (if (options.get("top_k")) |k| k.int64() else null) orelse 0), std.math.maxInt(u32))),
++            .top_k = @intCast(@min(@max(0, srv.topKFor((if (options.get("top_k")) |k| k.int64() else null) orelse 0)), std.math.maxInt(u32))),
+             .top_p = @floatCast(number(options.get("top_p")) orelse 1.0),
+             .min_p = @floatCast(number(options.get("min_p")) orelse 0.0),
+         };
+-- 
+2.43.0
+

@@ -1,0 +1,42 @@
+From b2252e0389fa984649cc6b5d3b0e79e2322fa165 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Tue, 20 Oct 2026 04:33:35 +0800
+Subject: [PATCH 3/4] =?UTF-8?q?dsv41=20zig:=202D=20(world=3D4)=20dense=20w?=
+ =?UTF-8?q?o=5Fb=20decode=20path=20=E2=80=94=20exchange=20the=20pair's=20p?=
+ =?UTF-8?q?lain=20u=20into=20xb=20and=20gemm=20on=20full=20width=20(was=20?=
+ =?UTF-8?q?notPorted)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ zig/src/families/dsv41/round.zig | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
+index 43f8a85..0d01bc2 100644
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -748,11 +748,16 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches,
+     }
+     try prompt.groupedRotated(e, ch, R, calls[0..lay.groups]);
+     try rd.mark(e, .a_woa);
+-    if (e.two != null and lay.wo_b.dense != 0) return notPorted(@src()); // 2D: the dense gemm's cross-pair input exchange
+-    if (e.two) |tw| try round2d.woExchange(tw, e, rd.xb, R); // 2D: the column partner's half of wo_b's input rows
++    // 2D: wo_b's whole input rows. The trellis path rotates each pair's half (woRot) and exchanges the halves;
++    // a dense wo_b takes the pair's plain u, so the exchange runs on it unrotated.
++    if (e.two) |tw| {
++        if (lay.wo_b.dense != 0) try tw.catRank(e, rd.u, rd.xb, R, tw.uw, 2) else try round2d.woExchange(tw, e, rd.xb, R);
++    }
+     try rd.mark(e, .a_x);
+     if (lay.wo_b.dense != 0) {
+-        try e.blas.linearDense(rd.u, uw, lay.wo_b.dense, rd.pa, @as(usize, @intCast(lay.wo_b.n)), R, lay.wo_b.k, lay.wo_b.n, true);
++        const dx: u64 = if (e.two != null) rd.xb else rd.u;
++        const dlx: usize = if (e.two != null) @intCast(lay.wo_b.k) else uw;
++        try e.blas.linearDense(dx, dlx, lay.wo_b.dense, rd.pa, @as(usize, @intCast(lay.wo_b.n)), R, lay.wo_b.k, lay.wo_b.n, true);
+     } else {
+         var cb_call = [_]exl3_linear.Call{.{ .layer = lay.wo_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xb, .y = rd.pa, .ldy = @intCast(lay.wo_b.n), .y_dtype = .f32, .counters = 0 }};
+         try prompt.groupedRotated(e, ch, R, &cb_call);
+-- 
+2.43.0
+

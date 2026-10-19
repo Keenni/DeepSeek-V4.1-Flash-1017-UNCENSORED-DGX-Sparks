@@ -1,0 +1,41 @@
+From 7def4b442456ff457ab654282b1a02efcb54a87f Mon Sep 17 00:00:00 2001
+From: root <root@dgx01>
+Date: Mon, 19 Oct 2026 07:04:13 +0800
+Subject: [PATCH 2/4] dsv41 zig: checkpoint widen bf16->f32 (the engram shards'
+ bf16 q/k_weight shadow the f32 mains)
+
+---
+ zig/src/families/dsv41/checkpoint.zig | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/zig/src/families/dsv41/checkpoint.zig b/zig/src/families/dsv41/checkpoint.zig
+index 840c3fc..a039a62 100644
+--- a/zig/src/families/dsv41/checkpoint.zig
++++ b/zig/src/families/dsv41/checkpoint.zig
+@@ -192,6 +192,7 @@ pub fn readFrom(sh: *const Shards, key: []const u8, bytes: ?[]const u8, out: []u
+         const from = try dtypeOf(t.dtype);
+         if (k.dtype == null or k.dtype.? == from) return @memcpy(out, t.bytes);
+         if (from == .f16 and k.dtype.? == .f32) return widenHalf(t.bytes, out);
++        if (from == .bf16 and k.dtype.? == .f32) return widenBf16(t.bytes, out); // bf16: its half words are f32's top halves
+         return error.UnsupportedConversion;
+     }
+     const es = (try dtypeOf(t.dtype)).size();
+@@ -233,6 +234,15 @@ fn widenHalf(src: []const u8, out: []u8) void {
+     }
+ }
+ 
++/// bf16 -> f32, exact: a brain half is f32's top 16 bits, the low half zero.
++fn widenBf16(src: []const u8, out: []u8) void {
++    const n = src.len / 2;
++    for (0..n) |i| {
++        const h: u32 = @as(u32, std.mem.readInt(u16, src[2 * i ..][0..2], .little)) << 16;
++        std.mem.writeInt(u32, out[4 * i ..][0..4], h, .little);
++    }
++}
++
+ test "loader keys parse as Python prints them" {
+     const p = try Key.parse("layers.3.ffn.experts.17.w2|None|(1152, 2304)|tr");
+     try std.testing.expect(p.exl3 and p.cols == null and p.rows.?[0] == 1152 and p.rows.?[1] == 2304);
+-- 
+2.43.0
+
