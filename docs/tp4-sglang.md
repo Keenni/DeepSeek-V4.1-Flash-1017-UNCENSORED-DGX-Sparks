@@ -1,6 +1,7 @@
-# TP4 — SGLang on four DGX Sparks (native FP8/FP4 checkpoint)
+# TP4 — SGLang on four DGX Sparks, switchless fibre ring (native FP8/FP4 checkpoint)
 
-This is the four-node production stack. It is
+This is the four-node production stack, on the same **switchless** fabric as the Zig line: four nodes, four
+direct fibre links, no switch. It is
 [MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks)
 at `64b02de` serving `DeepSeek-V4.1-Flash-1017-heretic` (native FP8 weights, FP4 routed experts, 48 shards,
 477 GB). We contribute the environment file and two start-script fixes; the tree itself is upstream and is

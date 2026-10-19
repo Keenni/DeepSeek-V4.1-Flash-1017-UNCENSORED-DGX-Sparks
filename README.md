@@ -5,9 +5,25 @@ uncensored form on NVIDIA DGX Spark (GB10) nodes: two-node **TP2** with TensorFo
 EXL3 2.9 bpw repack, and four-node **TP4** with either the same Zig engine or SGLang over the native
 FP8/FP4 checkpoint.
 
-Everything here ran on four GB10 nodes in a private lab (a switchless 200G fibre *ring*, no switch) and was
+Everything here ran on four GB10 nodes in a private lab (a **switchless** 200G fibre *ring*, no switch) and was
 verified with real requests. The scripts are the ones we actually run; the numbers are the ones we actually
 measured. [中文说明 →](README.zh-CN.md)
+
+**Keywords:** switchless TP4 · switchless fibre ring · DGX Spark TP4 · TensorFold Zig (compiled binary —
+patched by us per weight variant) · SGLang TP4 · EXL3 2.9 bpw · native FP8/FP4 · DeepSeek-V4.1-Flash-1017
+uncensored.
+
+Two things worth knowing before you read further:
+
+* **Both TP4 stacks here are switchless-TP4**: four nodes, four direct fibre links forming a ring, no switch
+  in the fabric. The Zig line is where that matters most — its 2D split wants diagonal pairs that a ring does
+  not have, so the diagonal goes through a four-node all-gather (our patch).
+* **The Zig engine is a binary, and it has no idea about your weights.** The engine ships as a compiled
+  `tensorfold-native` / `tf-dsv41-lanes` / `tf-dsv41-rank-cache` set. Every weight variant that is not the
+  upstream pack (our uncensored EXL3 repack has plain `wo_b` tensors, F8 dtypes in the Engram shards, and
+  bf16 duplicates that shadow the f32 mains) breaks it at load time, and the only fix is to **patch the engine
+  source and rebuild the binary** — which is exactly what our four commits do. Plan for that; it is not a
+  config change.
 
 ## Which stack, and why
 
@@ -35,7 +51,9 @@ docs/                       selection, per-stack bring-up notes, troubleshooting
 
 The engine itself is **not** redistributed: it is `bertholomus/TensorFold` (branch `deepseek-v41-zig-tp4`)
 built as a Zig native binary. We ship our four commits as `git format-patch` files under
-`dev/tp2-tensorfold-zig/engine-patches/` (they apply on top of upstream `5940208`). The SGLang stack is
+`dev/tp2-tensorfold-zig/engine-patches/` (they apply on top of upstream `5940208`) — and they exist because
+this is a **binary**: the uncensored repack only loads after patching the engine's safetensors dtypes, its
+linear path and its rank-cache writer, then rebuilding. The SGLang stack is
 `MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks` with our environment file and two small start-script fixes.
 
 ## The three stacks in one page

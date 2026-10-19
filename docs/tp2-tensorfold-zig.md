@@ -26,6 +26,30 @@ node's **f0** leg (`10.0.0.0/24`), `start-dsv41-zig-tp2-0304.sh` for the pair wi
    those layers out of the upstream Mia 2.9 bpw pack and writes `shared-w2-tf.safetensors` (172 MB) into the
    weight directory. Without it those layers fail to load.
 
+## The engine is a binary — and a different weight variant means writing engine patches
+
+You do not get this engine as a supported package that accepts "some checkpoint". You get three compiled
+binaries (`tensorfold-native`, `tf-dsv41-lanes`, `tf-dsv41-rank-cache`) plus `rdma_gather.fatbin`, built
+from `bertholomus/TensorFold` at `5940208`. That binary was written against the **upstream** pack layout; it
+does not validate or adapt to a repack. Our uncensored EXL3 checkpoint is a repack, and it broke the engine in
+four distinct places, each of which needed a source change and a rebuild:
+
+| what the checkpoint does differently | how the binary fails | patch |
+|---|---|---|
+| `layers.2-39.attn.wo_b` stored as plain `.weight` (no `.trellis`/`.suh`/`.svh`) | `KeyError: …wo_b.trellis`, or `error: UnsupportedDType` | `69158a0` — dense linear fallback (`Linear.dense`, `dn` cache entries, dense cuBLAS GEMM) |
+| the Engram shards (47/48) carry `F8_E4M3` / `F8_E8M0` tensors | the shard header parse dies before any key check, because the dtype table has no F8 | `69158a0` — F8 dtypes added to `core/safetensors.zig` |
+| the same shards also keep `bf16` copies of `q/k_weight` | they shadow the `f32` mains after name resolution → `UnsupportedConversion` while writing the rank cache | `7def4b4` — bf16→f32 widen that treats bf16 as the top 16 bits of an f32 (not f16) |
+| 27 layers' `shared_experts.w2` are plain, but the fused expert kernel cannot be split per layer | those layers fail to load | `fetch_shared_w2.py` copies the trellis trio for them out of the Mia pack into `shared-w2-tf.safetensors` |
+
+Two consequences:
+
+1. **A config-only expectation will burn you.** Budget for reading Zig source, patching, rebuilding and
+   redistributing binaries (three files per node, md5-identical across nodes, and stop the containers before
+   copying — otherwise `Text file busy`).
+2. **Check the weight *structure*, not the `config.json`.** `quantization_config` matching the upstream pack
+   byte for byte does not mean the tensors do: what matters is whether a key ends in `.trellis` or `.weight`
+   in `model.safetensors.index.json`. That single check tells you whether you need the dense patches.
+
 ## Start / stop / verify
 
 ```bash

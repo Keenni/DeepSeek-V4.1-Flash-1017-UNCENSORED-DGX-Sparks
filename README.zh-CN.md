@@ -4,8 +4,20 @@
 两机 **TP2** 走 TensorFold 的 Zig 引擎 + EXL3 2.9bpw 重打包；四机 **TP4** 走同一个 Zig 引擎，或者走
 SGLang + 原生 FP8/FP4 权重。
 
-这里的脚本是我们在跑的脚本，数字是我们实测的数字。测试环境是四台 GB10 组成的 **无交换机 200G 光纤环**
+这里的脚本是我们在跑的脚本，数字是我们实测的数字。测试环境是四台 GB10 组成的 **无交换机（switchless）200G 光纤环**
 （不是全互联），所有请求都是真实推理。[English →](README.md)
+
+**关键词：** switchless TP4 · 无交换机光纤环 · DGX Spark TP4 · TensorFold Zig（编译成二进制，按权重变体自己打
+patch）· SGLang TP4 · EXL3 2.9bpw · 原生 FP8/FP4 · DeepSeek-V4.1-Flash-1017 去审查。
+
+读之前先知道两件事：
+
+* **这里两套 TP4 都是 switchless-TP4**：四机、四条直连光纤成环、fabric 里没有交换机。对 **Zig 线**影响最大——
+  它的 2D 切分需要对角对，环上没有对角链路，所以对角流量走「四机 all-gather」（我们的 patch）。
+* **Zig 引擎是一个二进制，它不认识你的权重。** 交付形态是编好的 `tensorfold-native` / `tf-dsv41-lanes` /
+  `tf-dsv41-rank-cache`。任何不是上游原包的权重变体（我们的去审查 EXL3 包里 `wo_b` 是未量化 `.weight`、engram
+  片里是 F8 dtype、还有遮蔽 f32 主体的 bf16 副本）都会在加载期直接死，**唯一解法是改引擎源码、重编二进制**——
+  我们那 4 个 commit 就是干这个的。按这个量级做计划，它不是改配置能解决的。
 
 ## 选哪套，为什么
 
@@ -33,8 +45,9 @@ docs/                       选型、逐栈 bring-up、排障索引
 
 引擎本体**不重分发**：它是 `bertholomus/TensorFold` 分支 `deepseek-v41-zig-tp4` 编出的 Zig 原生二进制。
 我们把自己的 4 个 commit 以 `git format-patch` 形式放在 `dev/tp2-tensorfold-zig/engine-patches/`
-（叠在上游 `5940208` 之上）。SGLang 栈来自 `MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks`，我们给的是
-env 文件 + 两处启动脚本修复。
+（叠在上游 `5940208` 之上）——它们存在的唯一原因就是**这是个二进制**：去审查重打包的权重，必须改引擎的
+safetensors dtype 表、linear 路径和 rank-cache 写出逻辑、重编二进制之后才加载得起来。SGLang 栈来自
+`MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks`，我们给的是 env 文件 + 两处启动脚本修复。
 
 ## 三套栈各一段
 
