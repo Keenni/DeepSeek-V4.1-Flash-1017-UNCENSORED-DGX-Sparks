@@ -9,21 +9,24 @@ Everything here ran on four GB10 nodes in a private lab (a **switchless** 200G f
 verified with real requests. The scripts are the ones we actually run; the numbers are the ones we actually
 measured. [中文说明 →](README.zh-CN.md)
 
-**Keywords:** switchless TP4 · switchless fibre ring · DGX Spark TP4 · TensorFold Zig (compiled binary —
-patched by us per weight variant) · SGLang TP4 · EXL3 2.9 bpw · native FP8/FP4 · DeepSeek-V4.1-Flash-1017
-uncensored.
+**Keywords:** switchless TP4 · switchless fibre ring · DGX Spark TP4 · TensorFold Zig (AOT, no CUDA JIT —
+a new weight layout means engine source patches) · SGLang TP4 · EXL3 2.9 bpw · native FP8/FP4 ·
+DeepSeek-V4.1-Flash-1017 uncensored.
 
 Two things worth knowing before you read further:
 
 * **Both TP4 stacks here are switchless-TP4**: four nodes, four direct fibre links forming a ring, no switch
   in the fabric. The Zig line is where that matters most — its 2D split wants diagonal pairs that a ring does
   not have, so the diagonal goes through a four-node all-gather (our patch).
-* **The Zig engine is a binary, and it has no idea about your weights.** The engine ships as a compiled
-  `tensorfold-native` / `tf-dsv41-lanes` / `tf-dsv41-rank-cache` set. Every weight variant that is not the
-  upstream pack (our uncensored EXL3 repack has plain `wo_b` tensors, F8 dtypes in the Engram shards, and
-  bf16 duplicates that shadow the f32 mains) breaks it at load time, and the only fix is to **patch the engine
-  source and rebuild the binary** — which is exactly what our four commits do. Plan for that; it is not a
-  config change.
+* **The Zig engine has no runtime compilation on CUDA, so a weight layout it does not know is a source
+  change.** SGLang and vLLM are Python engines: a new quantisation or layout is usually a new class, and the
+  kernels are Triton-JIT / FlashInfer-autotune compiled on first use. TensorFold is AOT end to end — its CUDA
+  kernels are prebuilt cubins loaded with `cuModuleLoadData` (runtime compilation exists only on the
+  Metal/macOS path), and the checkpoint loader's dtype table and key dispatch are compiled into the binary.
+  Our uncensored EXL3 repack is a layout the engine had no code for (plain `wo_b` instead of `.trellis`, F8
+  dtypes in the Engram shards, bf16 copies shadowing the f32 mains), so there was nothing at runtime to fall
+  back on: we wrote the Zig code, rebuilt the fatbins and the three binaries. Expect the same for the next
+  variant.
 
 ## Which stack, and why
 
@@ -52,8 +55,8 @@ docs/                       selection, per-stack bring-up notes, troubleshooting
 The engine itself is **not** redistributed: it is `bertholomus/TensorFold` (branch `deepseek-v41-zig-tp4`)
 built as a Zig native binary. We ship our four commits as `git format-patch` files under
 `dev/tp2-tensorfold-zig/engine-patches/` (they apply on top of upstream `5940208`) — and they exist because
-this is a **binary**: the uncensored repack only loads after patching the engine's safetensors dtypes, its
-linear path and its rank-cache writer, then rebuilding. The SGLang stack is
+the engine compiles nothing at runtime on CUDA: the uncensored repack only loads after its compiled-in dtype
+table and linear path are taught the new layout, then the binaries are rebuilt. The SGLang stack is
 `MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks` with our environment file and two small start-script fixes.
 
 ## The three stacks in one page

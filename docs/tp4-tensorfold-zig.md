@@ -3,8 +3,9 @@
 Four GB10 nodes, one rank each, wired as a **switchless ring**: four direct fibre links (01↔02, 02↔03,
 03↔04, 04↔01), two HCA legs per node, **no switch anywhere in the fabric**. This document is about the
 things that are different from TP2; the weights, Engram and template prerequisites are identical
-(see [tp2-tensorfold-zig.md](tp2-tensorfold-zig.md)) — including the fact that the engine is a **compiled
-binary** and any weight variant beyond the upstream pack needs engine patches before it will load.
+(see [tp2-tensorfold-zig.md](tp2-tensorfold-zig.md)) — including the fact that the engine compiles nothing at
+runtime on CUDA, so a weight layout it has no code for needs Zig source changes and a rebuild rather than a
+config change.
 
 Measured: API ready in 60–61 s, decode 98.1 tok/s (direct probe, prose) / 133.3 tok/s c1 (sparkDash,
 structured), prefill 1423–1582 tok/s, 8M-position pool.
