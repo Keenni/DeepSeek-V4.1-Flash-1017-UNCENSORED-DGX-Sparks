@@ -35,9 +35,9 @@ Two things worth knowing before you read further:
 | Engine | **TensorFold Zig** (`tensorfold-native`) | **SGLang** (production) or TensorFold Zig |
 | Weights | EXL3 2.9 bpw uncensored repack | native FP8 + FP4 routed experts (heretic) |
 | Why | the only combination that **fits**: 477 GB of FP8 over 2 ranks is 238 GB/rank, beyond a GB10's 128 GB unified memory. EXL3 2.9 bpw is ~99 GB/rank — and only the Zig engine reads EXL3. | FP8 fits 4 ways, so SGLang becomes usable; the Zig TP4 line works but pays a ring tax (see below). |
-| KV pool | 1M positions (`POOL=1048576`, `PARALLEL=4`) | SGLang: 6.78M tokens (`mem-fraction-static 0.85`). Zig TP4: 8M positions (`TF_DS_WINDOW=8388608`, `PARALLEL=16`) |
-| Decode c1 (sparkDash, prose 400 tok) | 66.8 tok/s | SGLang 69.4 tok/s |
-| Prefill 32k | 1994 tok/s | SGLang 4921 tok/s |
+| KV pool | 1M positions (`POOL=1048576`, `PARALLEL=4`) | SGLang: 5.38M tokens (5,382,912; `mem-fraction-static 0.85` + RoCEnante mesh). Zig TP4: 8M positions (`TF_DS_WINDOW=8388608`, `PARALLEL=16`) |
+| Decode c1 (sparkDash, prose 400 tok) | 66.8 tok/s | SGLang 73.0 tok/s |
+| Prefill (sparkDash, 4k/8k/16k/32k) | 1,779 / 1,912 / 1,965 / 1,994 tok/s | SGLang **5,710 / 5,212 / 5,266 / 4,685 tok/s** |
 | State | production for TP2 | SGLang is the production TP4 stack; Zig TP4 is kept as a fast-decode experiment |
 
 Full reasoning, including the numbers behind each verdict: [docs/selection.md](docs/selection.md).
@@ -91,8 +91,11 @@ bash dev/tp4-sglang/start-dsv41-tp4.sh serve    # mutual-exclusion cleanup, work
 * Our contribution is configuration + two start-script fixes, notably: **with HiCache disabled you must also
   remove the `/hicache` bind mount**, otherwise every worker container dies in `Created` state with
   `mkdir /root/dsv41-hicache: file exists` (a stale NFS mount point) while the head still looks fine.
-* Measured (HiCache off, `mem-fraction-static 0.85`): KV pool **6,781,184 tokens**, 18.01 GB left outside
-  the pool, ready in 4.3 min from cold compile caches.
+* Measured on the 2026-10-25 production config (RoCEnante mesh, `CHUNKED_PREFILL_SIZE=8192`,
+  `mem-fraction-static 0.85`): KV pool **5,382,912 tokens**, 9.77 GB `available_gpu_mem` left outside the
+  pool, decode **73.0 tok/s c1**, prefill **5,710 / 5,212 / 5,266 / 4,685 tok/s** at 4k / 8k / 16k / 32k.
+  (The earlier HiCache-off / patched-NCCL config measured pool 6,781,184 and prefill 2,493–4,921 — quote the
+  dated config, the two generations differ by up to 2× on prefill.)
 * Engram has to be packed per node (~48 GB/node, ~100 s/layer) — the Zig line reads the checkpoint
   directly and never produces that directory, so switching back to SGLang always requires a repack.
 
@@ -126,7 +129,7 @@ within the same prompt type** — the tables say which. Direct probes used a 450
 
 * TP2's 1M-position KV pool is small; long multi-session work will queue.
 * TP4 Zig prefill is below TP2 because of the diagonal all-gather; the 8M pool is real but it is not free.
-* SGLang TP4 decode c1 (~69 tok/s on sparkDash prose) is close to TP2 Zig; the win is prefill and pool.
+* SGLang TP4 decode c1 (73 tok/s on sparkDash prose) is in the same band as TP2 Zig; the win is prefill and the pool.
 * The TP4 Zig line is a lab result: it works, it is reproducible, and we would not call it "more stable than
   SGLang" yet.
 

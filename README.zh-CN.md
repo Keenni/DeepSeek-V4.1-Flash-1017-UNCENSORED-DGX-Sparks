@@ -28,9 +28,9 @@ SGLang + 原生 FP8/FP4 权重。
 | 引擎 | **TensorFold Zig**（`tensorfold-native`） | **SGLang**（生产）或 TensorFold Zig |
 | 权重 | EXL3 2.9bpw 去审查重打包 | 原生 FP8 + FP4 routed experts（heretic） |
 | 为什么 | **唯一装得下的组合**：477 GB 的 FP8 摊到 2 个 rank = 238 GB/rank，超过 GB10 的 128 GB 统一内存；EXL3 2.9bpw 约 99 GB/rank 才进得去，而能吃 EXL3 的引擎只有 Zig（Python 线已冻结）。 | FP8 四路切得下，SGLang 才成立。Zig TP4 能跑，但要付环上通信税（见下）。 |
-| KV 池 | 1M positions（`POOL=1048576`、`PARALLEL=4`） | SGLang：6,781,184 token（`mem-fraction-static 0.85`）。Zig TP4：8M positions（`TF_DS_WINDOW=8388608`、`PARALLEL=16`） |
-| decode c1（sparkDash，prose 400 tok） | 66.8 tok/s | SGLang 69.4 tok/s |
-| prefill 32k | 1994 tok/s | SGLang 4921 tok/s |
+| KV 池 | 1M positions（`POOL=1048576`、`PARALLEL=4`） | SGLang：5,382,912 token（`mem-fraction-static 0.85` + RoCEnante mesh）。Zig TP4：8M positions（`TF_DS_WINDOW=8388608`、`PARALLEL=16`） |
+| decode c1（sparkDash，prose 400 tok） | 66.8 tok/s | SGLang 73.0 tok/s |
+| prefill（sparkDash，4k/8k/16k/32k） | 1,779 / 1,912 / 1,965 / 1,994 tok/s | SGLang **5,710 / 5,212 / 5,266 / 4,685 tok/s** |
 | 定位 | TP2 的生产栈 | SGLang 是 TP4 的生产栈；Zig TP4 作为高 decode 的实验栈保留 |
 
 完整推理与每个判断背后的数字：[docs/selection.md](docs/selection.md)。
@@ -82,8 +82,11 @@ bash dev/tp4-sglang/start-dsv41-tp4.sh serve    # 互斥清理 → worker-first 
 - 我们的贡献是配置 + 两处启动脚本修复，最要紧的一条：**关掉 HiCache 时必须同时摘掉 `/hicache` 挂载**，
   否则每台 worker 容器都卡在 `Created` 状态，报 `mkdir /root/dsv41-hicache: file exists`（残留 NFS 挂载点），
   而 head 看起来完全正常。
-- 实测（HiCache 关、`mem-fraction-static 0.85`）：KV 池 **6,781,184 token**，池外余量 18.01 GB，
-  编译缓存冷启到就绪 4.3 分钟。
+- 实测按 **2026-10-25 生产配置**（RoCEnante mesh、`CHUNKED_PREFILL_SIZE=8192`、`mem-fraction-static 0.85`）：
+  KV 池 **5,382,912 token**，池外 `available_gpu_mem` 9.77 GB，decode **73.0 tok/s c1**，
+  prefill **5,710 / 5,212 / 5,266 / 4,685 tok/s**（4k / 8k / 16k / 32k）。
+  （更早的 HiCache 关 + patched NCCL 配置是池 6,781,184、prefill 2,493–4,921 —— **引用必须带配置档**，
+  两代 prefill 差到 2×。）
 - Engram 要按节点打包（约 48 GB/节点，~100 s/层）——Zig 线直读 checkpoint、不产生这个目录，
   所以从 Zig 切回 SGLang 每次都要重打。
 
@@ -114,7 +117,7 @@ prose/structured 提示集，所以**跨栈对比只在同一 prompt 类型内�
 
 - TP2 的 1M positions 池偏小，长上下文多会话会排队。
 - TP4 Zig 的 prefill 低于 TP2（对角 all-gather），8M 池是真的，但不是免费的。
-- SGLang TP4 的 decode c1（sparkDash prose 约 69 tok/s）和 TP2 Zig 接近；它赢在 prefill 和池子。
+- SGLang TP4 的 decode c1（sparkDash prose 73 tok/s）和 TP2 Zig 同一档；它赢在 prefill 和池子。
 - TP4 Zig 是实验栈：可跑、可复现，但我们还不敢说它「比 SGLang 稳」。
 
 ## 致谢

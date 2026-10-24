@@ -7,8 +7,11 @@ at `64b02de` serving `DeepSeek-V4.1-Flash-1017-heretic` (native FP8 weights, FP4
 477 GB). We contribute the environment file and two start-script fixes; the tree itself is upstream and is
 not redistributed here.
 
-Measured: ready in 4.3 min from cold compile caches, KV pool 6,781,184 tokens, decode 69.4 tok/s c1
-(sparkDash, prose 400 tok), prefill 2,493–4,921 tok/s over 4k–32k.
+Measured on the 2026-10-25 production config (RoCEnante mesh, `CHUNKED_PREFILL_SIZE=8192`,
+`mem-fraction-static 0.85`): KV pool 5,382,912 tokens, decode 73.0 tok/s c1 (sparkDash, prose 400 tok),
+prefill **5,710 / 5,212 / 5,266 / 4,685 tok/s** at 4k / 8k / 16k / 32k. The 2,493–4,921 range quoted in
+older revisions of this file belongs to the 2026-10-20 config (HiCache off, patched NCCL) — always say which
+config a number came from.
 
 ## 1. What we changed, and why
 
@@ -49,6 +52,7 @@ head's copies; a drifted script once produced "workers never started" with no ot
 |---|---|---|---|---|---|---|
 | 2026-09-26 | ratio 0.18 | 0.85 | 3,930,368 | 88,576 | 14.14 GB | — |
 | 2026-10-20 | off | 0.85 | **6,781,184** | 88,576 | **18.01 GB** | 7.29 GB |
+| 2026-10-25 | off | 0.85 + RoCEnante mesh | **5,382,912** | 88,576 | — | 9.77 GB |
 
 Also: `c4=1,695,296`, `c128=52,978`, `c4_state=11,072`, `max_running_requests=16`.
 
@@ -87,7 +91,12 @@ shorter.
 | 3 | 42.58 | 124.80 | 285 ms |
 | 4 | 37.94 | 143.12 | 249 ms |
 
-Prefill: 4k 2,493 / 8k 4,664 / 16k 4,857 / 32k 4,921 tok/s (TTFT 1.65 / 1.76 / 3.38 / 6.66 s).
+Prefill (2026-10-20 config): 4k 2,493 / 8k 4,664 / 16k 4,857 / 32k 4,921 tok/s (TTFT 1.65 / 1.76 / 3.38 / 6.66 s).
+
+On the **2026-10-25 production config** (RoCEnante mesh + `CHUNKED_PREFILL_SIZE=8192`): decode c1 73.0,
+c2 59.42 mean / 118.33 aggregate, c3 47.49 / 140.71, c4 39.59 / 155.19 tok/s, prefill **4k 5,710 /
+8k 5,212 / 16k 5,266 / 32k 4,685 tok/s**. Single-stream decode is per-step-overhead bound (step 39.4 ms,
+accept 2.50), so quote c2–c4 aggregates when talking throughput.
 
 ## 6. Reading the numbers out of sparkDash
 

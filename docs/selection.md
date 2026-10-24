@@ -41,7 +41,8 @@ them** (this is the mistake we made first).
 |---|---|---|---|---|---|---|
 | Zig TP2 | prose | 66.8 | 91.6 | 116.9 | 128.0 | 1779 / 1912 / 1965 / 1994 |
 | Zig TP4 | structured | 133.3 | 153.7 | 165.0 | 197.8 | 1423 / 1514 / 1559 / 1582 |
-| SGLang TP4 | prose | 69.4 | 99.5 | 124.8 | 143.1 | 2493 / 4664 / 4857 / 4921 |
+| SGLang TP4, 2026-10-20 config (HiCache off, patched NCCL) | prose | 69.4 | 99.5 | 124.8 | 143.1 | 2493 / 4664 / 4857 / 4921 |
+| SGLang TP4, 2026-10-25 config (RoCEnante mesh + chunk 8192) | prose | 73.0 | 118.3 | 140.7 | 155.2 | 5710 / 5212 / 5266 / 4685 |
 
 Direct probes (our own client, prose/counting prompts): Zig TP4 decode 98.1 tok/s and prefill 1387 tok/s
 (9,009-token prompt); Zig TP2 prefill ~1696 tok/s.
@@ -49,8 +50,10 @@ Direct probes (our own client, prose/counting prompts): Zig TP4 decode 98.1 tok/
 Read it this way:
 
 * **Prefill**: SGLang TP4 ≫ everything. Zig TP2 is solid. Zig TP4 is the weakest — the all-gather tax.
-* **Decode c1**: SGLang TP4 and Zig TP2 are in the same band on the same prompt type (69.4 vs 66.8 prose);
+* **Decode c1**: SGLang TP4 and Zig TP2 are in the same band on the same prompt type (73.0 vs 66.8 prose);
   Zig TP4's much higher number is on a different (structured) prompt and from a different run.
+* **Prefill**: quote the dated config. Current SGLang (2026-10-25) is 5.2–5.7k tok/s at 4k–16k and 4.7k at
+  32k; the older 2.5–4.9k row is the same stack before the mesh + chunk-8192 changes.
 * **KV pool**: SGLang 6.78M tokens vs Zig TP2 1.0M positions vs Zig TP4 8.0M positions. If your workload is
   many long sessions, TP2's 1M pool is the first thing you will hit.
 
