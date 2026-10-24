@@ -10,9 +10,12 @@ Everything here stands on other people's work. Chain, outermost first.
   a directional ablation of the refusal direction applied to 38 `layers.N.attn.wo_b.weight` tensors
   (strength 2.5, blocks 2–39), everything else byte-identical to the base release, plus a
   `chat_template.jinja`. Method: [Heretic](https://github.com/p-e-w/heretic).
-* **EXL3 2.9 bpw repack (this repo's TP2 checkpoint)** — derived from MiaAI-Lab's
-  `Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw`; the uncensored repack is `dealignai/…-EXL3-2.9bpw-UNCENSORED`
-  with the `wo_b` tensors re-encoded from the heretic weights. Quantisation format: **ExLlamaV3**
+* **EXL3 2.9 bpw repack (this repo's TP2 checkpoint)** — derived from LibertAI's
+  `LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw` (196.3 GiB, 43 shards); the uncensored repack is
+  `dealignai/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw-UNCENSORED`, whose `wo_b` tensors carry **dealignai's own
+  CRACK ablation re-done at the target precision** (rank-1 per layer on layers 10–36, attention `wo_b` and
+  shared-expert `w2`), *not* pqhaz's heretic edit — the two stacks in this repo run two different
+  ablations. Quantisation format: **ExLlamaV3**
   (turboderp). `LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw` was the reference for what a mixed-bits
   EXL3 pack of this model looks like.
 
