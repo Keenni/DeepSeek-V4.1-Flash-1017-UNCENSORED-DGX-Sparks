@@ -10,7 +10,8 @@ verified with real requests. The scripts are the ones we actually run; the numbe
 measured. [中文说明 →](README.zh-CN.md)
 
 **Keywords:** switchless TP4 · switchless fibre ring · DGX Spark TP4 · TensorFold Zig (AOT, no CUDA JIT —
-a new weight layout means engine source patches) · SGLang TP4 · EXL3 2.9 bpw · native FP8/FP4 ·
+a new weight layout means engine source patches) · TensorFold TP4 native FP8 (MiaAI-Lab stack, prompt
+cache persisted to disk) · SGLang TP4 · EXL3 2.9 bpw · native FP8/FP4 ·
 DeepSeek-V4.1-Flash-1017 uncensored.
 
 Two things worth knowing before you read further:

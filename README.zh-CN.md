@@ -8,7 +8,8 @@ SGLang + 原生 FP8/FP4 权重。
 （不是全互联），所有请求都是真实推理。[English →](README.md)
 
 **关键词：** switchless TP4 · 无交换机光纤环 · DGX Spark TP4 · TensorFold Zig（全 AOT、CUDA 侧无 JIT——换权重
-布局就得改引擎源码）· SGLang TP4 · EXL3 2.9bpw · 原生 FP8/FP4 · DeepSeek-V4.1-Flash-1017 去审查。
+布局就得改引擎源码）· TensorFold TP4 原生 FP8（MiaAI-Lab 栈，prompt cache 落盘）· SGLang TP4 · EXL3 2.9bpw ·
+原生 FP8/FP4 · DeepSeek-V4.1-Flash-1017 去审查。
 
 读之前先知道两件事：
 
