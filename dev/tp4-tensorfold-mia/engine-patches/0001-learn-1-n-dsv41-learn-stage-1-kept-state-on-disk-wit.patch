@@ -1,0 +1,482 @@
+From 781468ebfd04484d17337caab46d6d25b0e13e2c Mon Sep 17 00:00:00 2001
+From: Keenni <Keenni@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 14:21:43 +0800
+Subject: [PATCH 1/3] =?UTF-8?q?learn(1/n):=20dsv41=20--learn=20stage=201?=
+ =?UTF-8?q?=20=E2=80=94=20kept=20state=20on=20disk=20with=20its=20extent's?=
+ =?UTF-8?q?=20compressed=20rows?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- model: extentBytes/extentCopy (the compressed plane of one extent, host<->device)
+- lanes: snapWriteFn/snapReadFn/snapForgetFn + learn_write/learn_read/learn_forget wire frames
+  (each rank writes its own <key>.r<rank>.bin; header pins chunk_rows/window/streams/at/pool, sha256 whole)
+- native/cuda: the three hooks wired into the prompt cache's Snapshots
+- prompt_cache: learn() charges the file's bytes (disk_bytes hook), not the slot's storage
+---
+ zig/src/core/prompt_cache.zig     |  11 +-
+ zig/src/families/dsv41/lanes.zig  | 249 +++++++++++++++++++++++++++++-
+ zig/src/families/dsv41/model.zig  |  50 ++++++
+ zig/src/families/dsv41/native.zig |  20 ++-
+ zig/src/native/cuda.zig           |  11 +-
+ 5 files changed, 335 insertions(+), 6 deletions(-)
+
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 7ba65cc..5ee0d9e 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -21,6 +21,8 @@ pub const Snapshots = struct {
+         drop: *const fn (ptr: *anyopaque, saved: Saved) void,
+         /// The storage a kept state holds: new storage up to `bytes`, or the spare storage it took (null: `bytes`).
+         charged: ?*const fn (ptr: *anyopaque, saved: Saved) u64 = null,
++        /// The bytes a learned file of a state at `at` tokens takes on disk (null: as `bytes`, the storage it holds).
++        disk_bytes: ?*const fn (ptr: *anyopaque, at: u32) u64 = null,
+         /// Free storage the family keeps for later saves, inside the budget (null: none).
+         spare: ?*const fn (ptr: *anyopaque) u64 = null,
+         /// Free spare storage until at most `room` bytes stay spare.
+@@ -347,10 +349,13 @@ pub const Store = struct {
+         const im = s.imprint orelse return;
+         const write = s.family.vtable.write orelse return;
+         const key = imprint.Imprint.keyOf(e.tokens);
+-        if (im.has(key) or e.bytes > im.cap) return;
+-        while (!im.fits(e.bytes)) s.unlearn(im, im.victim() orelse return); // the least recently used go first
++        // the file's bytes, not the storage the state holds: a family that learns more than its slot (dsv41's extent
++        // rows) fills the cap sooner than `bytes` says
++        const cost = if (s.family.vtable.disk_bytes) |f| f(s.family.ptr, e.at) else e.bytes;
++        if (im.has(key) or cost > im.cap) return;
++        while (!im.fits(cost)) s.unlearn(im, im.victim() orelse return); // the least recently used go first
+         write(s.family.ptr, e.saved, im.dir, key) catch |err| return note("learning {d} tokens failed ({s})", .{ e.at, @errorName(err) });
+-        im.add(key, e.at, e.tokens, starts, e.bytes) catch |err| return note("learning {d} tokens failed ({s})", .{ e.at, @errorName(err) });
++        im.add(key, e.at, e.tokens, starts, cost) catch |err| return note("learning {d} tokens failed ({s})", .{ e.at, @errorName(err) });
+         if (!@import("builtin").is_test) std.log.info("prompt cache: learned {d} tokens to disk", .{e.at});
+     }
+ 
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 3bdb159..61272f0 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -40,7 +40,7 @@ pub const image_piece = 32 << 10;
+ pub var logits_sha = false;
+ 
+ /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
+-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10, rdma_idle = 11 };
++pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10, rdma_idle = 11, learn_write = 12, learn_read = 13, learn_forget = 14 };
+ 
+ /// A frame being written.
+ pub const Wire = struct {
+@@ -375,9 +375,15 @@ pub const Lanes = struct {
+     first_row: []f32 = &.{},
+     first_of: ?*const lanes.Stream = null,
+     masked: []f32 = &.{},
++    /// TF_DS_LEARN_DIR: --learn's directory on this rank (each rank writes its own part of every kept state there).
++    learned: ?[]const u8 = null,
+ 
+     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
+         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
++        if (std.c.getenv("TF_DS_LEARN_DIR")) |v| {
++            const s = std.mem.span(v);
++            if (s.len > 0) ln.learned = s;
++        }
+         // the round costs by rows: ROUND_MS[min(rows, len) - 1] (the served table, or TF_DS_ROUND_MS)
+         const t = m.round_ms;
+         for (&ln.wc, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = t[@min(i, t.len - 1)] };
+@@ -1083,6 +1089,12 @@ pub const Lanes = struct {
+         return of(ptr).m.snapBytes();
+     }
+ 
++    /// --learn: the bytes a learned file takes at `at` tokens (the slot part and that extent's compressed rows).
++    pub fn snapDiskBytesFn(ptr: *anyopaque, at: u32) u64 {
++        const m = of(ptr).m;
++        return @as(u64, m.snapBytes()) + @as(u64, m.extentBytes(at));
++    }
++
+     /// The live state at `at` (the pass stands at that chunk end): the slot's own part copied, the extent's rows kept.
+     pub fn snapSaveFn(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
+         const self = of(ptr);
+@@ -1121,6 +1133,152 @@ pub const Lanes = struct {
+         self.gpa.destroy(sn);
+     }
+ 
++    // ---- --learn: a kept state on disk (this rank's slot part and its extent's compressed rows) ---------------
++
++    /// A learned state's file on this rank: `dir/<key:016x>.r<rank>.bin` (every rank writes its own part).
++    fn learnedPath(buf: []u8, dir: []const u8, key: u64, rank: u32) ![:0]const u8 {
++        return std.fmt.bufPrintSentinel(buf, "{s}/{x:0>16}.r{d}.bin", .{ dir, key, rank }, 0);
++    }
++
++    const learned_magic: u32 = 0x44534c31; // "DSL1"
++    const learned_version: u32 = 1;
++
++    /// The layout a read must match (a pool, window, stream count or rank change moves the rows: the file is refused).
++    fn learnedHeader(m: *const Model, at: usize, slot_bytes: usize, extent_bytes: usize) [16]u32 {
++        const pool: u64 = m.pool_cap;
++        return .{
++            learned_magic,       learned_version,                    m.rank,  model.chunk_rows,
++            @intCast(m.cfg.window), @intCast(m.streams),             @intCast(at), @truncate(slot_bytes),
++            @truncate(@as(u64, slot_bytes) >> 32), @truncate(extent_bytes), @truncate(@as(u64, extent_bytes) >> 32),
++            @truncate(pool),     @truncate(pool >> 32),              0,       0,
++            0,
++        };
++    }
++
++    /// A learned file: its header, its payload, and the payload's SHA-256 (a torn or foreign file is refused whole).
++    fn learnedWrite(path: [:0]const u8, header: [16]u32, payload: []const u8) !void {
++        const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
++        if (fd < 0) return error.LearnedWrite;
++        defer _ = std.c.close(fd);
++        try writeAll(fd, std.mem.sliceAsBytes(header[0..]));
++        try writeAll(fd, payload);
++        var hash: [32]u8 = undefined;
++        std.crypto.hash.sha2.Sha256.hash(payload, &hash, .{});
++        try writeAll(fd, &hash);
++        if (std.c.fsync(fd) != 0) return error.LearnedWrite;
++    }
++
++    fn learnedRead(path: [:0]const u8, want: [16]u32, payload: []u8) !void {
++        const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
++        if (fd < 0) return error.LearnedRead;
++        defer _ = std.c.close(fd);
++        const total: isize = @intCast(16 * 4 + payload.len + 32);
++        _ = std.c.lseek(fd, 0, std.c.SEEK.SET);
++        if (std.c.lseek(fd, 0, std.c.SEEK.END) != total) return error.LearnedRead;
++        var header: [16]u32 = undefined;
++        if (!preadAll(fd, std.mem.sliceAsBytes(header[0..]), 0)) return error.LearnedRead;
++        if (!std.mem.eql(u32, header[0..], want[0..])) return error.LearnedRead;
++        if (!preadAll(fd, payload, 64)) return error.LearnedRead;
++        var stored: [32]u8 = undefined;
++        if (!preadAll(fd, &stored, 64 + payload.len)) return error.LearnedRead;
++        var hash: [32]u8 = undefined;
++        std.crypto.hash.sha2.Sha256.hash(payload, &hash, .{});
++        if (!std.mem.eql(u8, &stored, &hash)) return error.LearnedRead;
++    }
++
++    fn writeAll(fd: c_int, bytes: []const u8) !void {
++        var done: usize = 0;
++        while (done < bytes.len) {
++            const n = std.c.write(fd, bytes.ptr + done, @min(bytes.len - done, 1 << 30));
++            if (n <= 0) return error.LearnedWrite;
++            done += @intCast(n);
++        }
++    }
++
++    fn preadAll(fd: c_int, bytes: []u8, at: usize) bool {
++        var done: usize = 0;
++        while (done < bytes.len) {
++            const n = std.c.pread(fd, bytes.ptr + done, @min(bytes.len - done, 1 << 30), @intCast(at + done));
++            if (n <= 0) return false;
++            done += @intCast(n);
++        }
++        return true;
++    }
++
++    /// --learn: kept state `saved` to its file here and, on the split, on every follower (each its own part). An
++    /// error unless this rank's file is written; a follower that fails leaves a gap the next read settles.
++    pub fn snapWriteFn(ptr: *anyopaque, saved: *anyopaque, dir: [:0]const u8, key: u64) anyerror!void {
++        const self = of(ptr);
++        const m = self.m;
++        const sn: *Snap = @ptrCast(@alignCast(saved));
++        const sb = m.snapBytes();
++        const eb = m.extentBytes(sn.at);
++        if (eb == 0) return error.NotAChunkEnd;
++        const host = try self.gpa.alloc(u8, sb + eb);
++        defer self.gpa.free(host);
++        try sn.buf.download(0, host[0..sb]);
++        try m.extentCopy(sn.base, sn.at, host.ptr + sb, true);
++        var buf: [1100]u8 = undefined;
++        try learnedWrite(try learnedPath(&buf, dir, key, m.rank), learnedHeader(m, sn.at, sb, eb), host);
++        if (try self.begin(.learn_write)) {
++            try self.wire.int(self.gpa, u64, key);
++            try self.wire.int(self.gpa, u64, sn.id);
++            try self.wire.int(self.gpa, u64, @intCast(sn.at));
++            try self.wire.int(self.gpa, u64, @intCast(sn.base));
++            try self.flush();
++        }
++    }
++
++    /// --learn: learned state `key` of `at` tokens read here and on every follower; a new kept state whose extent
++    /// this rank places afresh (the file's rows go there, the slot's part into its buffer).
++    pub fn snapReadFn(ptr: *anyopaque, dir: [:0]const u8, key: u64, at: u32) anyerror!*anyopaque {
++        const self = of(ptr);
++        const m = self.m;
++        const sb = m.snapBytes();
++        const eb = m.extentBytes(at);
++        if (eb == 0) return error.NotAChunkEnd;
++        const host = try self.gpa.alloc(u8, sb + eb);
++        defer self.gpa.free(host);
++        var buf: [1100]u8 = undefined;
++        try learnedRead(try learnedPath(&buf, dir, key, m.rank), learnedHeader(m, at, sb, eb), host);
++        var taken: [max_streams][2]usize = undefined;
++        var nt: usize = 0;
++        var it = self.streams.valueIterator();
++        while (it.next()) |l| {
++            taken[nt] = .{ l.base, l.end };
++            nt += 1;
++        }
++        const base = try self.placeKept(taken[0..nt], at, null);
++        const sn = try self.gpa.create(Snap);
++        errdefer self.gpa.destroy(sn);
++        sn.* = .{ .id = self.next_snap, .at = at, .base = base, .end = base + at, .buf = try cuda.DeviceBuffer.alloc(m.ctx.d, sb) };
++        errdefer sn.buf.free();
++        try m.extentCopy(base, at, host.ptr + sb, false);
++        try sn.buf.upload(0, host[0..sb]);
++        try self.snaps.append(self.gpa, sn);
++        self.next_snap += 1;
++        if (try self.begin(.learn_read)) {
++            try self.wire.int(self.gpa, u64, key);
++            try self.wire.int(self.gpa, u64, sn.id);
++            try self.wire.int(self.gpa, u64, at);
++            try self.wire.int(self.gpa, u64, @intCast(base));
++            try self.flush();
++        }
++        return sn;
++    }
++
++    /// --learn: learned state `key`'s file gone here and on every follower.
++    pub fn snapForgetFn(ptr: *anyopaque, dir: [:0]const u8, key: u64) void {
++        const self = of(ptr);
++        var buf: [1100]u8 = undefined;
++        const path = learnedPath(&buf, dir, key, self.m.rank) catch return;
++        _ = std.c.unlink(path);
++        if (self.begin(.learn_forget) catch false) {
++            self.wire.int(self.gpa, u64, key) catch {};
++            self.flush() catch |err| std.log.err("dsv41: a follower kept a forgotten learned state: {s}", .{@errorName(err)});
++        }
++    }
++
+     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
+         const self = of(ptr);
+         if (self.first_of == s) self.first_of = null;
+@@ -1180,6 +1338,13 @@ fn refused(err: anyerror) void {
+ /// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
+ pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 0 } = .{};
+ 
++/// TF_DS_LEARN_DIR: this rank's learned-state files (--learn; the head reads the same variable).
++fn learnDir() ?[]const u8 {
++    const v = std.c.getenv("TF_DS_LEARN_DIR") orelse return null;
++    const s = std.mem.span(v);
++    return if (s.len == 0) null else s;
++}
++
+ /// Rank 1 (each of ranks 1-3 on the four-node split): the primitives rank 0 sends, run in order until it says done.
+ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+     const peer = m.peer();
+@@ -1217,6 +1382,9 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+             9 => .done,
+             10 => .fill_resume,
+             11 => .rdma_idle,
++            12 => .learn_write,
++            13 => .learn_read,
++            14 => .learn_forget,
+             else => return error.BadFrame,
+         };
+         if (usesRdma(kind) and rdma_idle) {
+@@ -1344,6 +1512,85 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                     b.free();
+                 }
+             },
++            .learn_write => {
++                const key = try r.int(u64);
++                const id = try r.int(u64);
++                const at: usize = @intCast(try r.int(u64));
++                const base: usize = @intCast(try r.int(u64));
++                if (at % model.chunk_rows != 0) return error.BadFrame;
++                const b = kept.get(id) orelse return error.UnknownSnapshot;
++                const sb = m.snapBytes();
++                const eb = m.extentBytes(at);
++                const host = try gpa.alloc(u8, sb + eb);
++                defer gpa.free(host);
++                b.download(0, host[0..sb]) catch |err| {
++                    refused(err);
++                    continue;
++                };
++                m.extentCopy(base, at, host.ptr + sb, true) catch |err| {
++                    refused(err);
++                    continue;
++                };
++                const dir = learnDir() orelse return error.NoLearnedDir;
++                var pbuf: [1100]u8 = undefined;
++                const path = Lanes.learnedPath(&pbuf, dir, key, m.rank) catch |err| {
++                    refused(err);
++                    continue;
++                };
++                Lanes.learnedWrite(path, Lanes.learnedHeader(m, at, sb, eb), host) catch |err| refused(err);
++            },
++            .learn_read => {
++                const key = try r.int(u64);
++                const id = try r.int(u64);
++                const at: usize = @intCast(try r.int(u64));
++                const base: usize = @intCast(try r.int(u64));
++                if (at % model.chunk_rows != 0) return error.BadFrame;
++                const sb = m.snapBytes();
++                const eb = m.extentBytes(at);
++                const host = try gpa.alloc(u8, sb + eb);
++                defer gpa.free(host);
++                const dir = learnDir() orelse return error.NoLearnedDir;
++                var pbuf: [1100]u8 = undefined;
++                const path = Lanes.learnedPath(&pbuf, dir, key, m.rank) catch |err| {
++                    refused(err);
++                    continue;
++                };
++                Lanes.learnedRead(path, Lanes.learnedHeader(m, at, sb, eb), host) catch |err| {
++                    refused(err);
++                    continue;
++                };
++                var b = cuda.DeviceBuffer.alloc(m.ctx.d, sb) catch |err| {
++                    refused(err);
++                    continue;
++                };
++                b.upload(0, host[0..sb]) catch |err| {
++                    b.free();
++                    refused(err);
++                    continue;
++                };
++                m.extentCopy(base, at, host.ptr + sb, false) catch |err| {
++                    b.free();
++                    refused(err);
++                    continue;
++                };
++                if (kept.fetchRemove(id)) |kv| {
++                    var old = kv.value;
++                    old.free();
++                }
++                kept.put(gpa, id, b) catch |err| {
++                    b.free();
++                    refused(err);
++                    continue;
++                };
++            },
++            .learn_forget => {
++                const key = try r.int(u64);
++                const dir = learnDir() orelse return error.NoLearnedDir;
++                var pbuf: [1100]u8 = undefined;
++                if (Lanes.learnedPath(&pbuf, dir, key, m.rank)) |path| {
++                    _ = std.c.unlink(path);
++                } else |_| {}
++            },
+             .rdma_idle => {
+                 try m.ctx.synchronize();
+                 try peer.send(idle_ready);
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 90ae861..a561557 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -684,6 +684,56 @@ pub const Model = struct {
+         }
+     }
+ 
++    /// The compressed rows of one extent's positions `[0, at)`: what --learn writes beside the slot state (the plane
++    /// itself stays in the stream's extent; a kept state only holds it back from placement).
++    pub fn extentBytes(m: *const Model, at: usize) usize {
++        const c = m.eng.c;
++        var n: usize = 0;
++        for (m.eng.w.layers) |lay| {
++            if (lay.comp_wkv == null) continue;
++            const r: usize = lay.ratio;
++            if (r == 0 or at % r != 0) return 0;
++            const rows = at / r;
++            n += rows * (c.head_dim / 2) + rows * (c.head_dim / 16);
++            if (lay.idx_wk != null) n += rows * (c.index_head_dim / 2) + rows * (c.index_head_dim / 32);
++        }
++        return n;
++    }
++
++    /// Extent `base`'s compressed rows of positions `[0, at)` to `host` (save: true) or back from it (--learn).
++    pub fn extentCopy(m: *Model, base: usize, at: usize, host: [*]u8, save: bool) !void {
++        const c = m.eng.c;
++        const cs = &m.caches;
++        var off: usize = 0;
++        for (m.eng.w.layers, 0..) |lay, i| {
++            if (lay.comp_wkv == null) continue;
++            const r: usize = lay.ratio;
++            if (base % r != 0 or at % r != 0) return error.BadView;
++            const rows = at / r;
++            try m.copyHost(cs.comp_codes[i] + (base / r) * (c.head_dim / 2), host + off, rows * (c.head_dim / 2), save);
++            off += rows * (c.head_dim / 2);
++            try m.copyHost(cs.comp_scales[i] + (base / r) * (c.head_dim / 16), host + off, rows * (c.head_dim / 16), save);
++            off += rows * (c.head_dim / 16);
++            if (lay.idx_wk != null) {
++                try m.copyHost(cs.idx_codes[i] + (base / r) * (c.index_head_dim / 2), host + off, rows * (c.index_head_dim / 2), save);
++                off += rows * (c.index_head_dim / 2);
++                try m.copyHost(cs.idx_scales[i] + (base / r) * (c.index_head_dim / 32), host + off, rows * (c.index_head_dim / 32), save);
++                off += rows * (c.index_head_dim / 32);
++            }
++        }
++    }
++
++    /// A plane's `bytes` at `dev` to `host` (save) or back, synchronously: a learned state's file copy.
++    fn copyHost(m: *Model, dev: u64, host: [*]u8, bytes: usize, save: bool) !void {
++        if (bytes == 0) return;
++        const d = m.ctx.d;
++        if (save) {
++            try d.check(d.api.cuMemcpyDtoH_v2(host, dev, bytes), "cuMemcpyDtoH");
++        } else {
++            try d.check(d.api.cuMemcpyHtoD_v2(dev, host, bytes), "cuMemcpyHtoD");
++        }
++    }
++
+     /// The compressed rows of positions [0, at) of the extent at `from` copied into the extent at `to` (a kept prompt
+     /// resumed in another extent while a live stream holds its own), in the stream's order: every kv-source layer's
+     /// codes and scales and its index keys, the rows view() places at those positions.
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index b88ae94..f228902 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -81,6 +81,14 @@ pub const Snaps = struct {
+     save: *const fn (*anyopaque, ?*anyopaque, u32) anyerror!*anyopaque,
+     restore: *const fn (*anyopaque, ?*anyopaque, *anyopaque) anyerror!void,
+     drop: *const fn (*anyopaque, *anyopaque) void,
++    /// --learn: the state (its slot part and its extent's compressed rows) in this rank's files under `dir`.
++    write: ?*const fn (*anyopaque, *anyopaque, [:0]const u8, u64) anyerror!void = null,
++    /// --learn: the bytes a learned file takes at `at` tokens (the slot part and that extent's compressed rows).
++    disk_bytes: ?*const fn (*anyopaque, u32) u64 = null,
++    /// --learn: the state read back from those files, a new kept state (its extent placed afresh).
++    read: ?*const fn (*anyopaque, [:0]const u8, u64, u32) anyerror!*anyopaque = null,
++    /// --learn: those files gone.
++    forget: ?*const fn (*anyopaque, [:0]const u8, u64) void = null,
+ };
+ 
+ /// The rank's model and the backend over it (what `open` hands the server, freed by `deinit`).
+@@ -173,7 +181,17 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     st.lanes.vision = st.vision;
+     // the pool is the model's (preallocated): a stream takes no device memory of its own
+     const L = lanes_mod.Lanes;
+-    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn };
++    const snaps: Snaps = .{
++        .ptr = &st.lanes,
++        .bytes = L.snapBytesFn,
++        .save = L.snapSaveFn,
++        .restore = L.snapRestoreFn,
++        .drop = L.snapDropFn,
++        .write = L.snapWriteFn,
++        .disk_bytes = L.snapDiskBytesFn,
++        .read = L.snapReadFn,
++        .forget = L.snapForgetFn,
++    };
+     try st.lanes.idleRdma(); // park even before the first API request
+     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
+ }
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 17a3ed7..332db00 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -389,7 +389,16 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     if (@hasField(@TypeOf(loaded), "snaps")) if (loaded.snaps) |sn| {
+         const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);
+         if (want > 0) {
+-            h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
++            h.snap_vt = .{
++                .bytes = sn.bytes,
++                .save = sn.save,
++                .restore = sn.restore,
++                .drop = sn.drop,
++                .disk_bytes = if (@hasField(@TypeOf(sn), "disk_bytes")) sn.disk_bytes else null,
++                .write = if (@hasField(@TypeOf(sn), "write")) sn.write else null,
++                .read = if (@hasField(@TypeOf(sn), "read")) sn.read else null,
++                .forget = if (@hasField(@TypeOf(sn), "forget")) sn.forget else null,
++            };
+             h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{}, want);
+         }
+     };
+-- 
+2.43.0
+

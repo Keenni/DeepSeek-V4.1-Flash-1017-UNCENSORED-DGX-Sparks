@@ -1,0 +1,94 @@
+From 4136cd2f8fae261e9c753db906512a06d2442dcc Mon Sep 17 00:00:00 2001
+From: Keenni <Keenni@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 15:10:29 +0800
+Subject: [PATCH 2/3] learn(2/n): floor prompt-cache marks onto the family's
+ chunk (Rules.chunk)
+
+dsv41 keeps a state only at a chunk end (snapSaveFn) and already floors marks for its hook
+(markEnds), so the server's shared cuts (system_len-2048/-512/system_len, plain token counts)
+never hashed equal to a kept state's tokens -> e.shared stayed false -> --learn never ran.
+
+Rules.chunk (0 = none, GLM and others unchanged) floors marks() and noteShared() onto
+w/chunk*chunk. The hook's at set is identical before and after (markEnds floors the same way),
+so keep/resume behaviour is unchanged; only the shared flag now matches.
+---
+ zig/src/core/prompt_cache.zig     | 8 ++++++--
+ zig/src/families/dsv41/native.zig | 5 ++++-
+ zig/src/native/cuda.zig           | 5 ++++-
+ 3 files changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 5ee0d9e..0bca9bc 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -46,6 +46,10 @@ pub const Rules = struct {
+     planned: bool = false,
+     /// A mark other than the history's is kept only this far from every other mark and the resume point.
+     min_gap: u32 = 256,
++    /// The family's chunk granularity in tokens (0: none). A mark stands at a chunk end, so a family that only keeps
++    /// states there (a chunk-split prompt pass) has its marks floored onto these boundaries first — without it the
++    /// server's shared cuts (system-prompt lengths, plain token counts) never match a kept state and `--learn` stays off.
++    chunk: u32 = 0,
+     /// Shorter prompts keep nothing: below it a mark's extra prompt call costs more than a later turn's reuse saves.
+     min_prompt: u32 = 4096,
+ };
+@@ -186,7 +190,7 @@ pub const Store = struct {
+         if (e == null) s.counts.misses += 1;
+         const marks_ = try s.fitting(a, try s.marks(a, prompt, if (e) |x| x.at else 0, history_len, shared, starts, if (e) |x| x.last else &.{}));
+         for (shared) |w| { // the shared cuts this pass keeps: their states serve other conversations too
+-            const at = if (s.rules.planned) floorStart(starts, w) else w;
++            const at = if (s.rules.chunk > 1) w / s.rules.chunk * s.rules.chunk else if (s.rules.planned) floorStart(starts, w) else w;
+             if (std.mem.indexOfScalar(u32, marks_, at) != null) s.noteShared(prompt[0 .. at + s.rules.lookahead]);
+         }
+         s.reserve(prompt, e, marks_);
+@@ -265,7 +269,7 @@ pub const Store = struct {
+         }
+         try want.appendSlice(a, shared);
+         for (want.items, 0..) |w, k| {
+-            const at = if (s.rules.planned) floorStart(starts, w) else w;
++            const at = if (s.rules.chunk > 1) w / s.rules.chunk * s.rules.chunk else if (s.rules.planned) floorStart(starts, w) else w;
+             if (at <= from or at + s.rules.lookahead > prompt.len or at >= prompt.len or !s.usable(at, starts)) continue;
+             if (k > 0) { // the history's mark always; the others only away from it, each other and the resume point
+                 if (at - from < s.rules.min_gap) continue;
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index f228902..0d4cc59 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -71,6 +71,9 @@ pub const Loaded = struct {
+     lone: ?LoneRun = null,
+     /// Kept prompt states for the host's prompt cache (core/prompt_cache Snapshots: `ptr` and its functions).
+     snaps: ?Snaps = null,
++    /// This engine's prompt chunk granularity (a kept state stands at a chunk end; snapSaveFn enforces it). The
++    /// prompt cache floors its marks — including the server's shared cuts, which are plain token counts — onto it.
++    prompt_chunk: u32 = 0,
+     /// Images in requests (the server renders their placeholders; the tower runs on this rank).
+     vision: ?lanes.stream.Vision = null,
+ };
+@@ -193,7 +196,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         .forget = L.snapForgetFn,
+     };
+     try st.lanes.idleRdma(); // park even before the first API request
+-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
++    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .prompt_chunk = model.chunk_rows, .vision = if (st.vision) |v| v.hook() else null };
+ }
+ 
+ fn deinitFn(ptr: *anyopaque) void {
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 332db00..fe1a9e8 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -399,7 +399,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+                 .read = if (@hasField(@TypeOf(sn), "read")) sn.read else null,
+                 .forget = if (@hasField(@TypeOf(sn), "forget")) sn.forget else null,
+             };
+-            h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{}, want);
++            // a chunk-split family keeps states only at its chunk ends, and the server's shared cuts are plain token
++            // counts: floor every mark onto the family's chunk so those cuts can match a kept state (--learn)
++            const rules: api.prompt_cache.Rules = .{ .chunk = if (@hasField(@TypeOf(loaded), "prompt_chunk")) loaded.prompt_chunk else 0 };
++            h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, rules, want);
+         }
+     };
+     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
+-- 
+2.43.0
+

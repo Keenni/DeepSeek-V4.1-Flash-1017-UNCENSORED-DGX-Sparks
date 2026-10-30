@@ -35,6 +35,10 @@ Everything here stands on other people's work. Chain, outermost first.
   `start.sh` / `start-tp4*.sh`, `boot.py`, `adapter/`, RoCEnante overlay, the `canary-roce` Dockerfile. Our
   `dev/tp4-sglang/start-dsv41-tp4.sh` is a **modified copy** of their launcher (see NOTICE for licensing).
   Their `sparkDash` is the benchmark behind every number we quote. Copyright (C) 2026 zurih, AGPL-3.0.
+* **`MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks`, TensorFold four-node line** — the recipe our current TP4
+  production stack runs: the `local.sh` / `start.sh` orchestration, the patch series on top of
+  `bertholomus` `5940208`, and the native-FP8 weight layout. Our patches in
+  `dev/tp4-tensorfold-mia/engine-patches/` apply **after** their series.
 * **`MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks`** — the two-node Zig recipe, and the source of the
   **`chat_template.jinja`** we ship (md5 `dcf25a1f…`), which is the variant that works with TensorFold's
   Jinja subset.
@@ -56,6 +60,11 @@ Everything here stands on other people's work. Chain, outermost first.
   ring, why TCP-over-fibre collapses decode, and the four-node all-gather that replaces the diagonal exchange.
 * **SGLang stack**: the environment file, the HiCache-off-must-remove-the-mount fix, the NFS-helper gate, the
   pool calibration with HiCache off, and the claim that a Zig head answering `/v1/models` proves nothing.
+* **Prompt-cache-to-disk on the `dsv41` line** (three commits, `dev/tp4-tensorfold-mia/engine-patches/`):
+  persisting a kept state together with its extent's compressed rows (`extentBytes`/`extentCopy`, H2D
+  place-on-read), `Rules.chunk` so a shared cut hashes equal to the chunk-floored state that is actually
+  kept, the imprint in the CUDA host, `disk_bytes` accounting so the cap is charged the file's real size,
+  and the `planned`-on-dsv41 failure analysis. The `--learn` machinery itself is upstream TensorFold's.
 * All measurements quoted here.
 
 Not ours: the model, the quantisation formats, the engines, the kernels, the NCCL patch, the upstream

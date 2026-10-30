@@ -1,4 +1,4 @@
-# DeepSeek-V4.1-Flash-1017（去审查）在 DGX Spark 上的三套可用栈
+# DeepSeek-V4.1-Flash-1017（去审查）在 DGX Spark 上的四套可用栈
 
 把 **DeepSeek-V4.1-Flash-1017** 的去审查版跑在 NVIDIA DGX Spark（GB10）上的部署件、引擎补丁与实测数据：
 两机 **TP2** 走 TensorFold 的 Zig 引擎 + EXL3 2.9bpw 重打包；四机 **TP4** 走同一个 Zig 引擎，或者走
@@ -31,7 +31,7 @@ SGLang + 原生 FP8/FP4 权重。
 | KV 池 | 1M positions（`POOL=1048576`、`PARALLEL=4`） | SGLang：5,382,912 token（`mem-fraction-static 0.85` + RoCEnante mesh）。Zig TP4：8M positions（`TF_DS_WINDOW=8388608`、`PARALLEL=16`） |
 | decode c1（sparkDash，prose 400 tok） | 66.8 tok/s | SGLang 73.0 tok/s |
 | prefill（sparkDash，4k/8k/16k/32k） | 1,779 / 1,912 / 1,965 / 1,994 tok/s | SGLang **5,710 / 5,212 / 5,266 / 4,685 tok/s** |
-| 定位 | TP2 的生产栈 | SGLang 是 TP4 的生产栈；Zig TP4 作为高 decode 的实验栈保留 |
+| 定位 | TP2 的生产栈 | 2026-10-26 起 TP4 的生产栈是 MiaAI-Lab 四机 TensorFold 原生 FP8 栈；SGLang 是等价备选；Zig TP4 作为高 decode 的实验栈保留 |
 
 完整推理与每个判断背后的数字：[docs/selection.md](docs/selection.md)。
 
@@ -42,6 +42,7 @@ dev/tp2-tensorfold-zig/    TP2 Zig 启动/停止脚本、rank-cache 与 token-ma
                             验收探针、上游兼容补丁、我们自己的 4 个引擎 commit
 dev/tp4-tensorfold-zig/     TP4 Zig 启动/停止脚本、环上路由诊断脚本
 dev/tp4-sglang/             TP4 SGLang 启动脚本 + env 示例（上游树不重分发）
+dev/tp4-tensorfold-mia/     TP4 MiaAI-Lab TensorFold（原生 FP8）：我们的引擎补丁 + --learn 接线
 docs/                       选型、逐栈 bring-up、排障索引
 ```
 
@@ -50,8 +51,10 @@ docs/                       选型、逐栈 bring-up、排障索引
 （叠在上游 `5940208` 之上）——它们存在的唯一原因就是**引擎在 CUDA 侧不做运行期编译**：去审查重打包的权重，
 必须先让它编译进去的 dtype 表和 linear 路径认识这个布局，再重编 fatbin 与三个二进制。SGLang 栈来自
 `MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks`，我们给的是 env 文件 + 两处启动脚本修复。
+`dev/tp4-tensorfold-mia/` 放的是我们给 MiaAI-Lab 四机栈打的引擎补丁——三个 commit，让 `--learn`
+（前缀快照落盘 NVMe）在 `dsv41` 线上真正跑起来；它们叠在 MiaAI-Lab 补丁系列之上，不是裸 `5940208`。
 
-## 三套栈各一段
+## 四套栈各一段
 
 ### TP2 — TensorFold Zig + EXL3 2.9bpw
 
@@ -91,6 +94,28 @@ bash dev/tp4-sglang/start-dsv41-tp4.sh serve    # 互斥清理 → worker-first 
   所以从 Zig 切回 SGLang 每次都要重打。
 
 细节、标定表与 sparkDash 数据：[docs/tp4-sglang.md](docs/tp4-sglang.md)。
+
+### TP4 — MiaAI-Lab TensorFold（原生 FP8）—— 我们现在的 TP4 生产栈
+
+引擎 `bertholomus/TensorFold` 的 `5940208` + MiaAI-Lab 补丁系列，四机、原生 FP8 权重。我们跑的配置：
+`--pool 12582912`（12M positions，起栈 device memory 99.21 GB）、`--prompt-cache-gib 6` 给前缀快照池
+（CUDA 默认 0.5 GiB ≈ 80 个 state，几个长会话一小时就能轮一遍）、`--learn --learn-gib 200` 落在本机 NVMe。
+
+- **`--learn` 在这条线上原本完全不工作。** 三个缺口全在引擎侧，且都与 family 无关：`dsv41` 的快照只带
+  6.25 MiB 的 slot ring、丢了 extent 的压缩行；server 给的 shared cut 是纯 token 数，与 keep 时被
+  chunk 对齐过的 state 永远哈希不上，于是「shared」这个开关恒 false，而 `resumed at` 看起来一切正常；
+  imprint 索引只在 Metal/GLM 的 host 里建，`learn()` 第一行 `imprint orelse` 就返回。三个补丁在
+  `dev/tp4-tensorfold-mia/engine-patches/`。
+- 首个实测结果：`learned 2048 tokens to disk`，四台各一份 8,507,488 B 文件；随后同一条 prompt 仍
+  `resumed at 2048`、`cached_tokens 2048`——命中率零回归。跨重启读回已实现，但还没在生产日志里观察到，
+  文档里如实标了。
+- 换引擎版本 = 三个只读单文件挂载（`tensorfold-native`、`tf-dsv41-lanes`、`tf-dsv41-rank-cache` 只链
+  `libc`），不重建镜像，回滚只改一个路径。
+- 单独一行提醒的坑：**别用 `planned`** 来对齐 cut。这条线的 `starts` 是空的（`info.prefill_step == 0`），
+  每个 mark 都会被 floor 到 0、全部被过滤，整栈退化成 100% 全量 prefill，而日志里根本不会出现 `learned`。
+
+机制、体积账、完整故障链与验收清单：[docs/prompt-cache-learn.md](docs/prompt-cache-learn.md)；接线与编译：
+[dev/tp4-tensorfold-mia/README.md](dev/tp4-tensorfold-mia/README.md)。
 
 ### TP4 — TensorFold Zig（decode 最快，附条件多）
 

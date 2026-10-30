@@ -1,0 +1,80 @@
+From e6fa362b12e703d7e517ef8b5d39e461981e9b55 Mon Sep 17 00:00:00 2001
+From: Keenni <Keenni@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 15:26:23 +0800
+Subject: [PATCH 3/3] learn(3/n): the CUDA host builds the Imprint (--learn
+ worked only in glm_host)
+
+- native/cuda.zig: Host.learned + Imprint.open(identity = model dir, chunk, window, streams,
+  snaps.bytes(ptr, chunk); the last one separates world/quantization layouts) + store.imprint
+- prompt_imprint.osBuild: macOS-only (sysctlbyname) -> '' elsewhere (Linux link had undefined symbol)
+
+Without this the store's write/read/forget hooks never fire: learn() returns at 'imprint orelse'.
+Measured: 'learned 2048 tokens to disk', four ranks' files 8,507,488 B each, resume unchanged.
+---
+ zig/src/core/prompt_imprint.zig |  3 +++
+ zig/src/native/cuda.zig         | 21 +++++++++++++++++++++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/zig/src/core/prompt_imprint.zig b/zig/src/core/prompt_imprint.zig
+index 87675b4..b78266d 100644
+--- a/zig/src/core/prompt_imprint.zig
++++ b/zig/src/core/prompt_imprint.zig
+@@ -301,6 +301,9 @@ pub fn readAt(fd: c_int, dest: []u8, at: u64) bool {
+ 
+ /// This Mac's OS build (sysctl kern.osversion): its Metal compiler can change a kernel's bits.
+ pub fn osBuild(buf: []u8) []const u8 {
++    // a Mac's OS build only: Linux (CUDA hosts) has no sysctlbyname, and the identity's other fields already pin
++    // the layout (checkpoint dir, chunk/window/streams, the family's per-state bytes)
++    if (@import("builtin").os.tag != .macos) return "";
+     var n: usize = buf.len;
+     if (std.c.sysctlbyname("kern.osversion", buf.ptr, &n, null, 0) != 0) return "";
+     return std.mem.sliceTo(buf[0..n], 0);
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index fe1a9e8..98761ff 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -156,6 +156,8 @@ const Host = struct {
+     startup: []u8 = &.{},
+     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
+     cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
++    /// --learn: shared cuts' states on disk (each rank keeps its own part); the store above points into it.
++    learned: ?api.prompt_imprint.Imprint = null,
+     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
+ 
+     fn close(p: *anyopaque) void {
+@@ -165,6 +167,7 @@ const Host = struct {
+         h.cfg.deinit(h.gpa);
+         if (h.gpu) |g| g.ctx.makeCurrent() catch {};
+         if (h.cache) |*store| store.deinit(); // the family's kept states go before the family
++        if (h.learned) |*m| m.deinit(); // after the store that points into it
+         h.release(h.family);
+         if (h.gpu) |g| {
+             g.ctx.deinit();
+@@ -405,6 +408,24 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+             h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, rules, want);
+         }
+     };
++    // --learn: the Imprint the prompt cache writes shared cuts into. The CUDA host built none, so a store given
++    // write/read/forget stayed silent (learn() returns at `s.imprint orelse`). Identity = checkpoint dir + the
++    // chunk/window/streams shape + the family's per-state bytes (they differ by world and quantization), so another
++    // layout lands in another directory instead of reading a state of the wrong shape.
++    if (o.learn) |root| {
++        var ih = std.hash.Wyhash.init(0x6c726e31); // "lrn1"
++        ih.update(o.dir);
++        const per_state: u64 = if (@hasField(@TypeOf(loaded), "snaps")) (if (loaded.snaps) |s2| s2.bytes(s2.ptr, F.prompt_rows) else 0) else 0;
++        for ([_]u64{ @as(u64, F.prompt_rows), @intCast(window), @intCast(streams), per_state }) |x| ih.update(std.mem.asBytes(&x));
++        var osbuf: [64]u8 = undefined;
++        ih.update(api.prompt_imprint.osBuild(&osbuf));
++        ih.update(name);
++        const learn_cap: u64 = @intFromFloat(o.learn_gib * gib);
++        h.learned = try api.prompt_imprint.Imprint.open(gpa, root, ih.final(), learn_cap);
++        if (h.cache) |*store| store.imprint = &h.learned.?;
++        std.log.info("learned prompt states in {s} ({d} known, {d} of {d} MiB)", .{ h.learned.?.dir, h.learned.?.metas.items.len, h.learned.?.total() >> 20, learn_cap >> 20 });
++    }
++    errdefer if (h.learned) |*m| m.deinit();
+     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
+     const vision: ?api.Vision = if (@hasField(@TypeOf(loaded), "vision")) loaded.vision else null;
+     try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .prompt_cache = h.cache != null, .startup = h.startup, .efforts = familyEfforts(F), .vision = vision, .structures = loaded.backend.vtable.first_masked != null }, .{ .ctx = loaded.ctx, .text = F.explain });
+-- 
+2.43.0
+

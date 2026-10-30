@@ -1,4 +1,4 @@
-# DeepSeek-V4.1-Flash-1017 (uncensored) on DGX Sparks — three working stacks
+# DeepSeek-V4.1-Flash-1017 (uncensored) on DGX Sparks — four working stacks
 
 Deployment recipes, engine patches and measurements for serving **DeepSeek-V4.1-Flash-1017** in its
 uncensored form on NVIDIA DGX Spark (GB10) nodes: two-node **TP2** with TensorFold's Zig engine over an
@@ -38,7 +38,7 @@ Two things worth knowing before you read further:
 | KV pool | 1M positions (`POOL=1048576`, `PARALLEL=4`) | SGLang: 5.38M tokens (5,382,912; `mem-fraction-static 0.85` + RoCEnante mesh). Zig TP4: 8M positions (`TF_DS_WINDOW=8388608`, `PARALLEL=16`) |
 | Decode c1 (sparkDash, prose 400 tok) | 66.8 tok/s | SGLang 73.0 tok/s |
 | Prefill (sparkDash, 4k/8k/16k/32k) | 1,779 / 1,912 / 1,965 / 1,994 tok/s | SGLang **5,710 / 5,212 / 5,266 / 4,685 tok/s** |
-| State | production for TP2 | SGLang is the production TP4 stack; Zig TP4 is kept as a fast-decode experiment |
+| State | production for TP2 | production TP4 since 2026-10-26 is the MiaAI-Lab four-node TensorFold native-FP8 stack; SGLang is the equivalent fallback; Zig TP4 is kept as a fast-decode experiment |
 
 Full reasoning, including the numbers behind each verdict: [docs/selection.md](docs/selection.md).
 
@@ -49,6 +49,7 @@ dev/tp2-tensorfold-zig/    TP2 Zig deploy scripts, rank-cache/token-map builders
                             upstream-compat patches and our four engine commits
 dev/tp4-tensorfold-zig/     TP4 Zig deploy scripts, ring diagnostics routes
 dev/tp4-sglang/             TP4 SGLang deploy script + env example (upstream tree not redistributed)
+dev/tp4-tensorfold-mia/     TP4 MiaAI-Lab TensorFold (native FP8): our engine patches + --learn wiring
 docs/                       selection, per-stack bring-up notes, troubleshooting index
 ```
 
@@ -58,8 +59,11 @@ built as a Zig native binary. We ship our four commits as `git format-patch` fil
 the engine compiles nothing at runtime on CUDA: the uncensored repack only loads after its compiled-in dtype
 table and linear path are taught the new layout, then the binaries are rebuilt. The SGLang stack is
 `MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks` with our environment file and two small start-script fixes.
+`dev/tp4-tensorfold-mia/` holds our engine patches for the MiaAI-Lab four-node stack — three commits that
+make `--learn` (prompt-cache snapshots persisted to NVMe) actually run on the `dsv41` line; they apply on
+top of the MiaAI-Lab patch series, not on a bare `5940208`.
 
-## The three stacks in one page
+## The four stacks in one page
 
 ### TP2 — TensorFold Zig + EXL3 2.9 bpw
 
@@ -100,6 +104,32 @@ bash dev/tp4-sglang/start-dsv41-tp4.sh serve    # mutual-exclusion cleanup, work
   directly and never produces that directory, so switching back to SGLang always requires a repack.
 
 Details, calibration table and the sparkDash numbers: [docs/tp4-sglang.md](docs/tp4-sglang.md).
+
+### TP4 — MiaAI-Lab TensorFold (native FP8) — our current production TP4
+
+Engine `bertholomus/TensorFold` at `5940208` + the MiaAI-Lab series, four nodes, native FP8 weights.
+Serving config we run: `--pool 12582912` (12M positions, 99.21 GB of device memory at start),
+`--prompt-cache-gib 6` for the prefix snapshot store (the CUDA default is 0.5 GiB ≈ 80 states, which a
+few long sessions cycle through in an hour), and `--learn --learn-gib 200` on local NVMe.
+
+* **`--learn` did not work on this line at all.** All three gaps are engine-side and none is
+  family-specific: the `dsv41` snapshot only carried its 6.25 MiB slot ring and dropped the extent's
+  compressed rows; the server's shared cut (plain token counts) never hashed equal to the chunk-floored
+  state it kept, so the "shared" flag that gates learning stayed false while `resumed at` looked healthy;
+  and the imprint index was built only in the Metal/GLM host, so `learn()` returned on its first line.
+  Three patches, `dev/tp4-tensorfold-mia/engine-patches/`.
+* First measured result: `learned 2048 tokens to disk`, one file per rank of 8,507,488 B, next identical
+  request still `resumed at 2048` with `cached_tokens 2048` — no hit-rate regression. Cross-restart
+  read-back is implemented but not yet observed in a production log; the doc says so.
+* Engine upgrades are three read-only binary mounts (`tensorfold-native`, `tf-dsv41-lanes`,
+  `tf-dsv41-rank-cache` link only `libc`) — no image rebuild, and rollback is one path.
+* Trap worth its own line: do **not** set the prompt-cache rules to `planned` to align the cuts on this
+  line. `starts` is empty here (`info.prefill_step == 0`), so every mark floors to 0, every state is
+  filtered, and the whole stack degrades to 100 % re-prefill with no `learned` line to warn you.
+
+Mechanism, sizes, the whole failure chain and the verification checklist:
+[docs/prompt-cache-learn.md](docs/prompt-cache-learn.md) · wiring and build:
+[dev/tp4-tensorfold-mia/README.md](dev/tp4-tensorfold-mia/README.md).
 
 ### TP4 — TensorFold Zig (fastest decode, extra caveats)
 

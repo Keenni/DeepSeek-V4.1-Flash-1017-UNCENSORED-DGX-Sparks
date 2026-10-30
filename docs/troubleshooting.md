@@ -37,6 +37,17 @@ Symptom → where to look. Every row is a failure we actually hit.
 | No prefill speedup from L2 prefetch | pure NCCL data plane; the hook only sees RoCEnante collectives | expected — see [§8](tp4-sglang.md#8-known-gaps-we-have-not-closed) |
 | Boot takes much longer than usual | `/root/.cache/huggingface` was cleared (Triton/FlashInfer cold compile) | expected once |
 
+## Prompt cache / `--learn` (TP4, MiaAI-Lab TensorFold stack)
+
+| symptom | cause | fix |
+|---|---|---|
+| every request `resumed at 0`, `kept 0`, no states | prompt-cache rules set to `planned` — `starts` is empty on this line (`info.prefill_step == 0`), so all marks floor to 0 and are filtered | keep `planned = false`; align cuts with `Rules.chunk` instead ([§3.2](prompt-cache-learn.md#32-0002--the-shared-flag-never-matched-the-kept-at)) |
+| `resumed at` healthy but no `learned … to disk` line | imprint not built (CUDA host patch missing) or `--learn` never reached the engine | patches `0003`; check with `DRY_RUN=1 ./start-switchless.sh` |
+| `learned` in the log, host learn dir empty | the learn directory is not bind-mounted into the containers | add `-v $LEARN_DIR:$LEARN_DIR` ([§4](prompt-cache-learn.md#4-wiring-on-the-serving-side-no-image-rebuild)) |
+| files only on some ranks | the four nodes are not running the same build (the `learn_*` wire frames) | ship the same three binaries to all four |
+| `spare 0 MiB` with a nearly empty pool | family does not implement the `spare` callback | read headroom as `of Z MiB` − `X MiB`; not a fault |
+| long sessions suddenly re-prefill while the KV pool is free | prefix snapshot store full (capacity, no TTL) | raise `--prompt-cache-gib`; the main KV pool cannot help |
+
 ## Measurement
 
 | symptom | cause |
