@@ -32,7 +32,7 @@ SGLang + 原生 FP8/FP4 权重。
 | KV 池 | 1M positions（`POOL=1048576`、`PARALLEL=4`） | SGLang：5,382,912 token（`mem-fraction-static 0.85` + RoCEnante mesh）。Zig TP4：8M positions（`TF_DS_WINDOW=8388608`、`PARALLEL=16`） |
 | decode c1（sparkDash，prose 400 tok） | 66.8 tok/s | SGLang 73.0 tok/s |
 | prefill（sparkDash，4k/8k/16k/32k） | 1,779 / 1,912 / 1,965 / 1,994 tok/s | SGLang **5,710 / 5,212 / 5,266 / 4,685 tok/s** |
-| 定位 | TP2 的生产栈 | 2026-10-26 起 TP4 的生产栈是 MiaAI-Lab 四机 TensorFold 原生 FP8 栈；SGLang 是等价备选；Zig TP4 作为高 decode 的实验栈保留 |
+| 定位 | TP2 的生产栈 | 2026-10-26 起 TP4 的生产栈是 MiaAI-Lab 四机 TensorFold 原生 FP8 栈（2026-11-01 起跑全补丁整合版：42 个上游补丁 + 我们 8 个 + `--learn`）；SGLang 是等价备选；Zig TP4 作为高 decode 的实验栈保留 |
 
 完整推理与每个判断背后的数字：[docs/selection.md](docs/selection.md)。
 
@@ -110,10 +110,17 @@ bash dev/tp4-sglang/start-dsv41-tp4.sh serve    # 互斥清理 → worker-first 
 - 首个实测结果：`learned 2048 tokens to disk`，四台各一份 8,507,488 B 文件；随后同一条 prompt 仍
   `resumed at 2048`、`cached_tokens 2048`——命中率零回归。跨重启读回已实现，但还没在生产日志里观察到，
   文档里如实标了。
-- 换引擎版本 = 三个只读单文件挂载（`tensorfold-native`、`tf-dsv41-lanes`、`tf-dsv41-rank-cache` 只链
-  `libc`），不重建镜像，回滚只改一个路径。
+- 换引擎版本 = 只读挂载，不重建镜像（三个引擎件只链 `libc`），回滚只改一个路径。**但要挂整个工具目录**：
+  镜像自带 18 个工具停在镜像的补丁档，只挂三个二进制会让其余 16 个留在旧版——拿镜像里的 `tf-dsv41-load`
+  量加载速度，量的就是旧代码（实测：旧形态 17 件 `IMAGE` + 1 件 `SAME`）。整套挂载后 19 件全 `SAME`。
+- 2026-11-01 起跑**全补丁整合版**：42 个上游补丁（含 0046 权重预读，worker 加载 83 s → 28 s；0042 JSON
+  答复不再被当成 tool call；0039/0040 两个崩溃修复）+ 我们 9001–9008（长跑 host 内存与泄漏，**不是吞吐**）
+  + `--learn`。同池实测 prefill 4k/16k/32k 3376/3667/3727 tok/s、decode c1 75 tok/s，与上一版同档持平。
 - 单独一行提醒的坑：**别用 `planned`** 来对齐 cut。这条线的 `starts` 是空的（`info.prefill_step == 0`），
   每个 mark 都会被 floor 到 0、全部被过滤，整栈退化成 100% 全量 prefill，而日志里根本不会出现 `learned`。
+
+版本与回滚纪律（一个权威源码仓、buildid 登记表、整套挂载）：[docs/version-management.md](docs/version-management.md)；
+上游 2026-11-01 那轮 42 个补丁逐条取舍、以及上游至今没修的长跑内存问题：[docs/upstream-2026-11-01.md](docs/upstream-2026-11-01.md)。
 
 机制、体积账、完整故障链与验收清单：[docs/prompt-cache-learn.md](docs/prompt-cache-learn.md)；接线与编译：
 [dev/tp4-tensorfold-mia/README.md](dev/tp4-tensorfold-mia/README.md)。

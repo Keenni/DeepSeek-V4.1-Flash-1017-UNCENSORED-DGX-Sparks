@@ -16,6 +16,9 @@ patch series — not to a bare `5940208` checkout.
 | `0001-learn-1-n-dsv41-learn-stage-1-...` | dsv41 `--learn` stage 1: a kept state is persisted **with its extent's compressed rows**; `learn_write/read/forget` wire frames; per-rank files; `disk_bytes` accounting |
 | `0002-learn-2-n-floor-prompt-cache-marks-onto-the-family-s.patch` | `Rules.chunk`: floor `marks()` and `noteShared()` onto the family's chunk, so the server's shared cut hashes equal to the kept (chunk-floored) state |
 | `0003-learn-3-n-the-CUDA-host-builds-the-Imprint-...` | the CUDA host builds the imprint (it existed only in `glm_host`), + `osBuild()` non-macOS |
+| `0005-ours-9001-server-history-len.patch` | `prepare()` renders the whole history once, not twice, to compute `history_len` (head anon peak 22.7 → 13.1 GiB on a 500k-token session) |
+| `0006-ours-9002-template-str-concat-inplace.patch` | `str + str` resizes the arena's last block in place instead of `std.mem.concat` (O(N²) template rendering) |
+| `0007-ours-9003-9008-arena-memory-leaks-decode-switches.patch` | keep-alive connection arena 1 MiB · render scratch on the template's arena · tokenizer scratch on a 4 KiB stack · host row tables 8192 · `TF_DS_SOLO_OVERHEAD` / `TF_DS_NO_COPIES` · an Engram AIO buffer leak. Memory and correctness, **not** throughput |
 
 Mechanism, numbers, pitfalls and the verification checklist: [../../docs/prompt-cache-learn.md](../../docs/prompt-cache-learn.md).
 
@@ -34,7 +37,10 @@ sanity check that the code is in.
 ## Deploy side (mount the binaries, do not rebuild the image)
 
 `tensorfold-native`, `tf-dsv41-lanes` and `tf-dsv41-rank-cache` link only `libc`; CUDA, cuBLAS, NCCL
-and libibverbs are resolved at runtime. A version bump is therefore three read-only single-file mounts:
+and libibverbs are resolved at runtime. A version bump is therefore read-only mounts — and it must be the
+**whole tool directory**, not the three binaries: the image carries 18 tools at its own patch level, and a
+benchmark run through the image's `tf-dsv41-load` measures the old code (see
+[../../docs/version-management.md](../../docs/version-management.md)):
 
 ```bash
 # scripts/local.sh

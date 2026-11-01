@@ -1,0 +1,682 @@
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 0c93615f..c7ef6942 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -450,6 +450,13 @@ pub const LaneHost = struct {
+             _ = h.drop(job, "the drafter could not start");
+             return false;
+         };
++        // Keep ownership here until Stream.init succeeds. A failed setup drops
++        // the job; drop's true means work was handled, not that setup succeeded.
++        const reply_grammar = if (r.structure) |st| h.constraint(st) catch |e| {
++            job.proposer.deinit();
++            _ = h.drop(job, if (e == error.OutOfMemory) "out of memory" else "the reply's grammar could not start (xgrammar)");
++            return false;
++        } else null;
+         job.stream = lanes.Stream.init(h.gpa, .{
+             .id = "request",
+             .prompt = r.prompt,
+@@ -467,12 +474,10 @@ pub const LaneHost = struct {
+             .chunks = r.chunks,
+             .reuse = reuse,
+             .images = r.images,
+-            .grammar = if (r.structure) |st| h.constraint(st) catch |e| {
+-                job.proposer.deinit();
+-                return h.drop(job, if (e == error.OutOfMemory) "out of memory" else "the reply's grammar could not start (xgrammar)");
+-            } else null,
++            .grammar = reply_grammar,
+         }) catch {
+             job.proposer.deinit();
++            if (reply_grammar) |g| g.deinit(h.gpa);
+             _ = h.drop(job, "out of memory");
+             return false;
+         };
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index 5161f586..6c59979e 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -12,6 +12,8 @@ pub const default_prior = [_]f64{ 0.85, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.5, 0.
+ 
+ /// What a backend reports about its loaded model: the attributes the Python engine reads at setup.
+ pub const Model = struct {
++    solo_head_overhead_ms: ?f64 = null, // fixed overhead for a lone head window; null keeps the live estimate
++    copy_proposals: bool = true, // suffix-lookup copy windows; false opts a backend out
+     exact_width: u32 = 1, // the widest window that reproduces one-token steps bit for bit
+     first_copy_rows: u32 = 0, // a lone stream's first copy window (0: the exact width)
+     gpu_tokens: bool = false, // one-token rounds may run a step ahead (pipelined)
+@@ -38,6 +40,8 @@ pub const Model = struct {
+ };
+ 
+ pub const Config = struct {
++    solo_head_overhead_ms: ?f64 = null, // fixed overhead for a lone head window; null keeps the live estimate
++    copy_proposals: bool = true, // suffix-lookup copy windows; false opts a backend out
+     family_width: u32,
+     max_copy: u32,
+     first_copy: u32,
+@@ -125,6 +129,8 @@ pub const Config = struct {
+             .shared_costs = try alloc.extendCosts(gpa, timed.items, batch_rows),
+             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
+             .mtp_step_ms = m.mtp_step_ms,
++            .solo_head_overhead_ms = m.solo_head_overhead_ms,
++            .copy_proposals = m.copy_proposals,
+         };
+     }
+ 
+diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
+index 940c7192..30b57140 100644
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -133,9 +133,20 @@ fn headTrunk(e: *Engine, s: *Stream, p: Plan, levels: usize) !?fill.Trunk {
+ }
+ 
+ /// Copied spans backed by `enter_match` matching tokens (Python `_copy_proposal`); the proposer owns them.
++/// A backend may opt out of suffix-lookup copies; the other gates are unchanged.
++fn copyAllowed(enabled: bool, max_copy: u32, forced: usize) bool {
++    return enabled and max_copy != 0 and forced == 0;
++}
++
++/// A lone head window may cost a fixed allowance instead of the live estimate.
++fn soloHeadOverhead(fixed: ?f64, observed: f64, alone: bool, streams: usize, kind: anytype) f64 {
++    if (alone and streams == 1 and kind == .head) return fixed orelse observed;
++    return observed;
++}
++
+ pub fn copyProposal(e: *Engine, s: *Stream) ![]const u32 {
+     const p = s.proposer orelse return &.{};
+-    if (e.cfg.max_copy == 0 or s.force.items.len > 0) return &.{};
++    if (!copyAllowed(e.cfg.copy_proposals, e.cfg.max_copy, s.force.items.len)) return &.{};
+     const width: u32 = if (e.alone) (s.copy_width orelse e.cfg.first_copy) else e.cfg.first_copy;
+     const copied = p.propose(s.context.items, @min(@as(i64, width), s.draftRoom() - 1)) catch return &.{};
+     if (copied.len < 2 or p.lastMatch() < e.cfg.enter_match) return &.{};
+@@ -175,7 +186,9 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
+             pr.* = try nodeChances(e, p.stream, n);
+         }
+     }
+-    const counts = try alloc.allocateRows(a, fixed, probs, &e.cfg.shared_costs, e.rule.overheadMs(plans.len), @max(plans.len, e.cfg.batch_rows), e.rule.draft_row_ms, plans.len);
++    const kind: @TypeOf(plans[0].kind) = if (plans.len > 0) plans[0].kind else .none;
++    const overhead = soloHeadOverhead(e.cfg.solo_head_overhead_ms, e.rule.overheadMs(plans.len), e.alone, plans.len, kind);
++    const counts = try alloc.allocateRows(a, fixed, probs, &e.cfg.shared_costs, overhead, @max(plans.len, e.cfg.batch_rows), e.rule.draft_row_ms, plans.len);
+     for (plans, probs, counts) |*p, chances, c| {
+         if (p.kind == .head) {
+             p.stream.granted = c;
+diff --git a/zig/src/core/template/template.zig b/zig/src/core/template/template.zig
+index fe64adb8..d633e8e7 100644
+--- a/zig/src/core/template/template.zig
++++ b/zig/src/core/template/template.zig
+@@ -100,7 +100,7 @@ pub fn compile(gpa: Allocator, source: []const u8, diag: ?*Diag) Error!Compiled
+ 
+ /// Renders with Hugging Face's variables: messages, tools (none when absent), documents, add_generation_prompt, then `context`.
+ pub fn render(gpa: Allocator, t: *const Compiled, messages: std.json.Value, tools: std.json.Value, context: std.json.Value, add_generation_prompt: bool, diag: ?*Diag) Error![]u8 {
+-    var arena = std.heap.ArenaAllocator.init(gpa);
++    var arena = std.heap.ArenaAllocator.init(t.arena.child_allocator);
+     defer arena.deinit();
+     const a = arena.allocator();
+     var out: std.ArrayList(u8) = .empty;
+diff --git a/zig/src/core/tokenizer/tokenizer.zig b/zig/src/core/tokenizer/tokenizer.zig
+index 176d9958..edd31245 100644
+--- a/zig/src/core/tokenizer/tokenizer.zig
++++ b/zig/src/core/tokenizer/tokenizer.zig
+@@ -114,7 +114,9 @@ pub const Tokenizer = struct {
+ 
+     /// Token ids for `text`, without post-processor tokens; invalid UTF-8 reads as U+FFFD. Caller frees with `a`.
+     pub fn encode(t: *const Tokenizer, a: Allocator, text: []const u8) Error![]u32 {
+-        var arena = std.heap.ArenaAllocator.init(a);
++        var stack: [4 * 1024]u8 = undefined;
++        var fallback = std.heap.BufferFirstAllocator.init(&stack, t.allocator);
++        var arena = std.heap.ArenaAllocator.init(fallback.allocator());
+         defer arena.deinit();
+         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
+         var valid = text;
+@@ -181,7 +183,9 @@ pub const Tokenizer = struct {
+ 
+     /// Text for `ids` through the decoder chain; unknown ids are skipped. Caller frees with `a`.
+     pub fn decode(t: *const Tokenizer, a: Allocator, ids: []const u32, skip_special_tokens: bool) Error![]u8 {
+-        var arena = std.heap.ArenaAllocator.init(a);
++        var stack: [4 * 1024]u8 = undefined;
++        var fallback = std.heap.BufferFirstAllocator.init(&stack, t.allocator);
++        var arena = std.heap.ArenaAllocator.init(fallback.allocator());
+         defer arena.deinit();
+         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
+         var tokens = try std.ArrayList([]const u8).initCapacity(ctx.a, ids.len);
+diff --git a/zig/src/families/dsv41/draft.zig b/zig/src/families/dsv41/draft.zig
+index cad18ad1..a22115d3 100644
+--- a/zig/src/families/dsv41/draft.zig
++++ b/zig/src/families/dsv41/draft.zig
+@@ -350,8 +350,8 @@ pub const PassGraphs = struct {
+             std.log.err("drafter pass graph of {d} streams, {d} steps failed on another rank; the pass fails on every rank", .{ N, steps });
+             return error.GraphCaptureFailed;
+         }
+-        var exec = exec_got.?;
+-        errdefer exec.deinit();
++        const exec = exec_got.?;
++        // The cache owns exec from here, including when the first launch fails.
+         g.map.putAssumeCapacity(key, exec);
+         try exec.launchOn(e.s);
+     }
+diff --git a/zig/src/families/dsv41/engram_aio.zig b/zig/src/families/dsv41/engram_aio.zig
+index 970a062f..dfd87f3b 100644
+--- a/zig/src/families/dsv41/engram_aio.zig
++++ b/zig/src/families/dsv41/engram_aio.zig
+@@ -138,6 +138,7 @@ pub const Aio = struct {
+         const reads = 2 * ids.len;
+         if (reads > a.slots or reads >= 1 << 20) return error.TooManyRows;
+         if (t.row_w + block > slot or t.row_s + block > slot) return error.RowTooWide;
++        for (ids) |x| if (x < 0 or @as(u64, @intCast(x)) >= t.rows) return error.RowOutOfRange; // before the batch allocates
+         const fd_w = if (t.fd_wd >= 0) t.fd_wd else t.fd_w;
+         const fd_s = if (t.fd_sd >= 0) t.fd_sd else t.fd_s;
+         // the ring's slots [head, head + reads) must be free: reap until no live batch of the last lap holds them
+@@ -174,8 +175,7 @@ pub const Aio = struct {
+             const i = j >> 1;
+             const sc = j & 1 == 1;
+             const rb = if (sc) t.row_s else t.row_w;
+-            const row: u64 = @intCast(ids[i]);
+-            if (row >= t.rows) return error.RowOutOfRange;
++            const row: u64 = @intCast(ids[i]); // checked above
+             const off = (if (sc) t.base_s else t.base_w) + row * rb;
+             const lo = std.mem.alignBackward(u64, off, block);
+             b.skew[j] = @intCast(off - lo);
+@@ -387,3 +387,46 @@ test "AIO rows equal the pool's, across a ring that wraps" {
+     const nine: [9]i64 = @splat(0);
+     try std.testing.expectError(error.TooManyRows, aio.start(tab, &nine, &big_w, &big_s));
+ }
++
++test "a refused row id leaves the ring and its allocations as they were" {
++    const a = std.testing.allocator;
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{ .iterate = true });
++    defer tmp.cleanup();
++    const rows = 40;
++    var json_buf: [256]u8 = undefined;
++    const json = try std.fmt.bufPrint(&json_buf, "{{\"layers.1.engram.embed.weight\":{{\"dtype\":\"U8\",\"shape\":[{d},100],\"data_offsets\":[0,{d}]}},\"layers.1.engram.embed.scale\":{{\"dtype\":\"U8\",\"shape\":[{d},3],\"data_offsets\":[{d},{d}]}}}}", .{ rows, rows * 100, rows, rows * 100, rows * 103 });
++    var file: std.ArrayList(u8) = .empty;
++    defer file.deinit(a);
++    var len: [8]u8 = undefined;
++    std.mem.writeInt(u64, &len, json.len, .little);
++    try file.appendSlice(a, &len);
++    try file.appendSlice(a, json);
++    for (0..rows * 103) |i| try file.append(a, @intCast((i * 7 + 3) % 251));
++    try tmp.dir.writeFile(io, .{ .sub_path = "engram.safetensors", .data = file.items });
++    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
++    defer a.free(dir);
++    var t = try engram_io.Tables.open(a, io, dir);
++    defer t.close();
++    const tab = t.layers.get(1).?;
++    const aio = Aio.init(a, io, 16) catch |e| switch (e) {
++        error.AioUnavailable => return error.SkipZigTest,
++        else => return e,
++    };
++    defer aio.deinit();
++    var w: [2 * 100]u8 = undefined;
++    var sc: [2 * 3]u8 = undefined;
++    // an id past the table after a good one, and a negative id: refused before anything is allocated
++    try std.testing.expectError(error.RowOutOfRange, aio.start(tab, &.{ 3, rows }, &w, &sc));
++    try std.testing.expectError(error.RowOutOfRange, aio.start(tab, &.{-1}, w[0..100], sc[0..3]));
++    // the ring still reads: the same bytes as the pool
++    const pool = try engram_io.Pool.init(a, io, 2);
++    defer pool.deinit(a);
++    var want_w: [2 * 100]u8 = undefined;
++    var want_s: [2 * 3]u8 = undefined;
++    try pool.gather(tab, &.{ 3, rows - 1 }, &want_w, &want_s);
++    const id = try aio.start(tab, &.{ 3, rows - 1 }, &w, &sc);
++    try aio.wait(id);
++    try std.testing.expectEqualSlices(u8, &want_w, &w);
++    try std.testing.expectEqualSlices(u8, &want_s, &sc);
++}
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 61272f0a..936d7844 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -366,6 +366,8 @@ pub const Lanes = struct {
+     // draft ms, the other live streams at their table depth), so a round takes at most those drafts: at any number of
+     // streams (all), or with one stream live (solo: the served one-stream choice; more keep the lane core's allocation)
+     served_k: enum { off, all, solo } = .off,
++    solo_overhead: bool = false, // TF_DS_SOLO_OVERHEAD=1: a lone drafted stream's head windows cost the fixed draft allowance
++    no_copies: bool = false, // TF_DS_NO_COPIES=1: a drafted stream proposes no suffix-lookup copy windows
+     drawn: [ring]u32 = undefined,
+     next: u64 = 0,
+     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
+@@ -445,6 +447,8 @@ pub const Lanes = struct {
+             .drafts = if (self.m.dr) |dr| @intCast(dr.n) else 1,
+             .window_costs = self.wc[0..],
+             .mtp_step_ms = draft.draft_ms,
++            .solo_head_overhead_ms = if (drafting and self.solo_overhead) draft.draft_ms else null,
++            .copy_proposals = !(drafting and self.no_copies),
+             .streams_exact = true,
+             .hidden_rows = true,
+             .batch_rows = @intCast(self.m.eng.round_rows),
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 0d4cc59b..e2bd36d5 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -174,6 +174,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     });
+     errdefer st.m.close();
+     st.lanes = lanes_mod.Lanes.init(gpa, st.m);
++    if (getenv("TF_DS_SOLO_OVERHEAD")) |v| st.lanes.solo_overhead = !std.mem.eql(u8, v, "0");
++    if (getenv("TF_DS_NO_COPIES")) |v| st.lanes.no_copies = !std.mem.eql(u8, v, "0");
+     errdefer st.lanes.deinit();
+     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
+     if (getenv("TF_DS_SERVED_K")) |t| st.lanes.served_k = if (std.mem.eql(u8, t, "1") or std.mem.eql(u8, t, "all")) .all else if (std.mem.eql(u8, t, "solo")) .solo else .off;
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index a3787257..14b62207 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -64,6 +64,8 @@ const pruned_rows: usize = 512;
+ pub const ring_extra = 16;
+ /// model.py's RAW: per-position compressor inputs kept (a ratio-2 group's earlier row for the next chunk).
+ pub const raw_rows = 64;
++/// The longest prompt pass the host-side row tables (vis, the compressor groups) hold.
++pub const max_pass_rows = 8192;
+ 
+ /// Device memory carved in 256-byte aligned pieces from blocks allocated as it grows, all freed together: the first
+ /// block init's size, then blocks of `block` bytes; a piece of `own` bytes or more takes a block of its own (the
+@@ -1061,7 +1063,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
+         const src = sh.kv_layer orelse return error.NoKvSource;
+         const n_comp_end = (start + n) / r;
+         // vis = (pos + 1) // ratio: the compressed entries row i may see (host-made: the same integers)
+-        var vis_host: [4096]i64 = undefined;
++        var vis_host: [max_pass_rows]i64 = undefined;
+         if (n > vis_host.len) return error.ChunkTooLong;
+         for (0..n) |i| vis_host[i] = @intCast((start + i + 1) / r);
+         try upload(e, ch.vis, &vis_host, n * 8);
+@@ -1186,8 +1188,8 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared,
+     }
+     sh.kv_layer = li;
+     // groups first // r .. and their positions group * r (the rotations _rot reads)
+-    var g_host: [4096]i64 = undefined;
+-    var p_host: [4096]i64 = undefined;
++    var g_host: [max_pass_rows]i64 = undefined;
++    var p_host: [max_pass_rows]i64 = undefined;
+     if (full > g_host.len) return error.ChunkTooLong;
+     for (0..full) |j| {
+         g_host[j] = @intCast(start / r + j);
+diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
+index deff59a7..28d92f90 100644
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -1078,8 +1078,8 @@ pub const Graphs = struct {
+             std.log.err("graph capture of rows {d} bucket {d} stretch {d} failed on another rank; the round fails on every rank", .{ key.rows, key.bucket, key.stretch });
+             return error.GraphCaptureFailed;
+         }
+-        var exec = exec_got.?;
+-        errdefer exec.deinit();
++        const exec = exec_got.?;
++        // The cache owns exec from here, including when the first launch fails.
+         g.map.putAssumeCapacity(key, .{ .exec = exec, .start = start, .end = cy.* });
+         try exec.launchOn(e.s);
+     }
+diff --git a/zig/src/families/dsv41/weights.zig b/zig/src/families/dsv41/weights.zig
+index cbfe5d70..a4066881 100644
+--- a/zig/src/families/dsv41/weights.zig
++++ b/zig/src/families/dsv41/weights.zig
+@@ -286,7 +286,7 @@ pub const Weights = struct {
+ 
+ /// Where entries come from: the lane's rank cache file, or the checkpoint read by the split.
+ pub const Source = union(enum) {
+-    cache: struct { file: std.Io.File, index: *const rank_cache.Index, io: std.Io },
++    cache: struct { file: std.Io.File, index: *const rank_cache.Index, io: std.Io, pf: ?*Prefetch = null },
+     shards: *const checkpoint.Shards,
+ 
+     pub fn size(s: Source, key: []const u8) !usize {
+@@ -302,6 +302,7 @@ pub const Source = union(enum) {
+                 const e = c.index.get(key) orelse return error.MissingEntry;
+                 if (e.bytes != out.len) return error.BadSize;
+                 if (try c.file.readPositionalAll(c.io, out, e.offset) != out.len) return error.ShortRead;
++                if (c.pf) |pf| _ = pf.pos.fetchMax(e.offset + e.bytes, .monotonic);
+             },
+             .shards => |sh| try checkpoint.read(sh, key, out),
+         }
+@@ -318,6 +319,69 @@ pub fn strips(src: []const u8, out: []u8, kt: usize, nt: usize, tile: usize) voi
+     };
+ }
+ 
++/// The rank cache read ahead of the loader (TF_DS_LOAD_PREFETCH=0 turns it off). The file
++/// holds the entries in the loader's order and the loader reads them one at a time, so every read waited on the disk:
++/// ~1 GB/s from an NVMe that reads 9 GB/s in parallel, 83 s for a node's 81 GB. A few threads pread the file in chunks
++/// up to `lead` bytes past the loader's furthest read, so its reads come from the page cache (27 s). The threads'
++/// bytes are dropped: the loader's own reads, and so the weights, are unchanged. A bounded lead matters: with the
++/// whole file cached first the load took 48 s, the page cache and the landing weights competing for the same memory.
++const Prefetch = struct {
++    io: std.Io,
++    fd: std.posix.fd_t,
++    size: u64,
++    pos: std.atomic.Value(u64) = .init(0), // the end of the loader's furthest read
++    next: std.atomic.Value(u64) = .init(0), // the next chunk to read ahead
++    stop: std.atomic.Value(bool) = .init(false),
++    threads: [threads_n]std.Thread = undefined,
++    started: usize = 0,
++
++    const threads_n = 8;
++    const chunk: u64 = 32 << 20;
++    const lead: u64 = 4 << 30;
++
++    fn on() bool {
++        const v = std.c.getenv("TF_DS_LOAD_PREFETCH") orelse return true;
++        return !std.mem.eql(u8, std.mem.span(v), "0");
++    }
++
++    fn start(p: *Prefetch) void {
++        for (&p.threads) |*th| {
++            th.* = std.Thread.spawn(.{}, run, .{p}) catch break;
++            p.started += 1;
++        }
++    }
++
++    fn finish(p: *Prefetch) void {
++        p.stop.store(true, .monotonic);
++        for (p.threads[0..p.started]) |th| th.join();
++        p.started = 0;
++    }
++
++    fn run(p: *Prefetch) void {
++        const buf = std.heap.page_allocator.alloc(u8, chunk) catch return;
++        defer std.heap.page_allocator.free(buf);
++        while (!p.stop.load(.monotonic)) {
++            const at = p.next.fetchAdd(chunk, .monotonic);
++            if (at >= p.size) return;
++            while (at > p.pos.load(.monotonic) + lead) {
++                if (p.stop.load(.monotonic)) return;
++                std.Io.sleep(p.io, .fromMilliseconds(2), .awake) catch {};
++            }
++            const n: usize = @intCast(@min(chunk, p.size - at));
++            var done: usize = 0;
++            while (done < n) {
++                const r = std.c.pread(p.fd, buf.ptr + done, n - done, @intCast(at + done));
++                if (r < 0) {
++                    if (std.c.errno(r) == .INTR) continue;
++                    return; // the loader reads it itself
++                }
++                if (r == 0) return;
++                done += @intCast(r);
++            }
++        }
++    }
++};
++
+ const Loader = struct {
+     gpa: std.mem.Allocator,
+     d: *const cuda.Driver,
+@@ -957,7 +1021,17 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, c: Confi
+     var w: Weights = .{ .gpa = gpa };
+     errdefer w.deinit();
+     var L: Loader = .{ .gpa = gpa, .d = d, .src = src, .w = &w };
++    var pf: Prefetch = undefined;
++    var pf_on = false;
++    if (src == .cache and Prefetch.on()) {
++        const rc = src.cache;
++        pf = .{ .io = rc.io, .fd = rc.file.handle, .size = rc.index.data_end };
++        L.src.cache.pf = &pf;
++        pf.start();
++        pf_on = true;
++    }
+     defer {
++        if (pf_on) pf.finish();
+         L.host.deinit(gpa);
+         L.aux.deinit(gpa);
+     }
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 2906f726..80faee37 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -7,6 +7,7 @@ const fields_mod = @import("fields.zig");
+ const reply_text = @import("reply_text.zig");
+ const tool_stream = @import("tool_stream.zig");
+ const tool_parse = @import("tool_parse.zig");
++const output_diagnostics = @import("output_diagnostics.zig");
+ const prompt_mod = @import("prompt.zig");
+ const log = @import("log.zig");
+ const ids = @import("ids.zig");
+@@ -42,7 +43,11 @@ pub const Sink = struct {
+     call: *const fn (ctx: *anyopaque, delta: Value) error{Closed}!void,
+ };
+ 
++/// A JSON answer is data; offered tools still belong in its prompt.
++pub const ResponseChannel = enum { automatic, structured_json };
++
+ pub const Reply = struct {
++    response_channel: ResponseChannel,
+     content: []const u8,
+     stop_sequence: ?[]const u8,
+     reasoning: ?[]const u8,
+@@ -124,6 +129,7 @@ fn flag(f: Value, key: []const u8) ?bool {
+ 
+ /// A request rendered and checked but not submitted; it holds the preparing count until generate or release.
+ pub const Prepared = struct {
++    response_channel: ResponseChannel,
+     input: Input,
+     request: api.Request,
+     prompt_len: usize,
+@@ -198,7 +204,11 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+             request.think_end = srv.think_close_end;
+         }
+     }
+-    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .stops = stops_opt, .preparing = preparing };
++    const response_channel: ResponseChannel = if (request.structure) |st| switch (st.kind) {
++        .json, .json_schema => .structured_json,
++        else => .automatic,
++    } else .automatic;
++    return .{ .response_channel = response_channel, .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .stops = stops_opt, .preparing = preparing };
+ }
+ 
+ /// Submit a prepared request and collect its reply; ``sink`` hears the stream (null: not streamed).
+@@ -237,11 +247,11 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     };
+     release(srv, preparing); // a background request waits only while a foreground one prepares
+     preparing = false;
+-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = input.token_ids };
++    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = if (prepared.response_channel == .structured_json) &.{} else input.tools, .token_ids = input.token_ids, .response_channel = prepared.response_channel };
+     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     const result: Failure!Reply = blk: {
+-        if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
++        if (sink != null and gen.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, gen.tools) catch |e| break :blk e;
+         gen.loop(gone) catch |e| break :blk e;
+         break :blk gen.finish(cx, prepared.prompt_len, received, submitted, thinking, effort, prepared.sampled, prepared.drafts);
+     };
+@@ -302,6 +312,7 @@ const Shown = struct {
+ 
+ /// The token loop and the text it streams.
+ const Generation = struct {
++    response_channel: ResponseChannel,
+     srv: *Server,
+     a: Allocator,
+     box: *Mailbox,
+@@ -392,7 +403,7 @@ const Generation = struct {
+             answer = split.answer;
+         }
+         const shown = if (g.calls != null) try reply_text.hideInto(g.a, &g.hidden, answer, false) else answer;
+-        const vis = reply_text.streamingVisible(shown);
++        const vis = if (g.response_channel == .structured_json) shown else reply_text.streamingVisible(shown);
+         const copied = @intFromPtr(vis.ptr) >= @intFromPtr(g.hidden.items.ptr) and @intFromPtr(vis.ptr) <= @intFromPtr(g.hidden.items.ptr) + g.hidden.items.len;
+         const delta = g.streamed.after(vis, !copied);
+         if (delta.len > 0) {
+@@ -499,7 +510,7 @@ const Generation = struct {
+             const r = reply_text.pyStrip(split.reasoning);
+             reasoning = if (r.len > 0) r else null;
+             content = split.answer;
+-        } else {
++        } else if (g.response_channel != .structured_json) {
+             const h = reply_text.parseHarmony(text);
+             content = h.content;
+             reasoning = h.reasoning;
+@@ -523,6 +534,11 @@ const Generation = struct {
+         const decode_s: f64 = if (prefilled) |p| @max(0, seconds(finished_ns - p)) else 0;
+         const decode_tokens = g.collected.items.len -| 1;
+         const runtime = try json.newObject(a);
++        if (g.tools.len > 0) if (output_diagnostics.toolWarning(content)) |warning| {
++            const code = @tagName(warning);
++            try runtime.put(a, "tool_parse_warning", .{ .string = code });
++            log.line("warning: {s} tool_parse_warning={s}", .{ g.reply_id, code });
++        };
+         try runtime.put(a, "enable_thinking", .{ .bool = thinking });
+         try runtime.put(a, "reasoning_effort", if (!thinking) .{ .string = "none" } else if (effort) |e| .{ .string = e } else .null);
+         try runtime.put(a, "engine", .{ .string = g.srv.info.name });
+@@ -561,6 +577,7 @@ const Generation = struct {
+         if (m.telemetry.len > 0) if ((try json.parse(a, m.telemetry)) == .ok) try spec.put(a, "proposer", (try json.parse(a, m.telemetry)).ok);
+         const think_end: ?u32 = if (thinking) g.srv.text.tokenId(g.srv.markers.close) else null;
+         const reply: Reply = .{
++            .response_channel = g.response_channel,
+             .content = content,
+             .stop_sequence = g.stops.matched(raw),
+             .reasoning = reasoning,
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 4a38a89a..8debd45b 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -302,6 +302,7 @@ const Run = struct {
+ 
+     /// ``ToolCallPolicy.finish``: the reply's calls parsed out of its content.
+     fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
++        if (reply.response_channel == .structured_json) return null;
+         const tools = r.plan.input.tools;
+         if (tools.len == 0) return null;
+         const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
+@@ -438,21 +439,22 @@ const Run = struct {
+ 
+     fn stream(r: *Run, gone: Gone, field: []const u8) void {
+         const a = r.a;
+-        const tools = r.plan.input.tools.len > 0;
++        const has_tools = r.plan.input.tools.len > 0;
+         var cx: Cx = .{ .a = a };
+         // a context-window refusal is reported inside the stream; every other refusal is still a 400 before it opens
+         var compaction: ?compact.Stamp = null;
+         const prepared = if (r.srv.config.compact_at == null) chat.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
+-            if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
++            if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, has_tools, field);
+             return r.unsent(&cx, e, field);
+         } else blk: {
+             const ready = compact.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
+-                if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
++                if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, has_tools, field);
+                 return r.unsent(&cx, e, field);
+             };
+             compaction = ready.stamp;
+             break :blk ready.prepared;
+         };
++        const tools = has_tools and prepared.response_channel != .structured_json;
+         var handed = false; // generate gives the preparing count back from here on
+         defer if (!handed) chat.release(r.srv, prepared.preparing);
+         r.out.vt.open(r.out.ctx) catch return;
+diff --git a/zig/src/server/output_diagnostics.zig b/zig/src/server/output_diagnostics.zig
+new file mode 100644
+index 00000000..67bcb86e
+--- /dev/null
++++ b/zig/src/server/output_diagnostics.zig
+@@ -0,0 +1,35 @@
++//! Conservative output diagnostics. A warning never repairs or reclassifies content.
++const std = @import("std");
++
++pub const ToolWarning = enum { orphan_dsml_closers };
++
++/// Recognize only a whole answer made of known closing tags and ASCII whitespace.
++/// Prose, quotes, JSON, code fences, openers and partial/unknown tags remain ordinary text.
++/// The caller limits this check to answers with active tools outside the JSON channel.
++pub fn toolWarning(answer: []const u8) ?ToolWarning {
++    const blanks = " \t\r\n";
++    const closers = [_][]const u8{
++        "</\u{ff5c}DSML\u{ff5c} parameter>",
++        "</\u{ff5c}DSML\u{ff5c} invoke>",
++        "</\u{ff5c}DSML\u{ff5c} calls>",
++        "</\u{ff5c}DSML\u{ff5c}parameter>",
++        "</\u{ff5c}DSML\u{ff5c}invoke>",
++        "</\u{ff5c}DSML\u{ff5c}tool_calls>",
++    };
++    var rest = std.mem.trim(u8, answer, blanks);
++    if (rest.len == 0) return null;
++    while (rest.len > 0) {
++        const n = for (closers) |tag| {
++            if (std.mem.startsWith(u8, rest, tag)) break tag.len;
++        } else return null;
++        rest = std.mem.trimStart(u8, rest[n..], blanks);
++    }
++    return .orphan_dsml_closers;
++}
++
++test "output diagnostic is limited to complete orphan closing tags" {
++    const close = "</\u{ff5c}DSML\u{ff5c} calls>";
++    try std.testing.expectEqual(ToolWarning.orphan_dsml_closers, toolWarning(" \n" ++ close ++ "\t" ++ close ++ "\r").?);
++    try std.testing.expectEqual(ToolWarning.orphan_dsml_closers, toolWarning("</\u{ff5c}DSML\u{ff5c}parameter></\u{ff5c}DSML\u{ff5c}invoke></\u{ff5c}DSML\u{ff5c}tool_calls>").?);
++    for ([_][]const u8{ "", " \t", "\"" ++ close ++ "\"", "```\n" ++ close ++ "\n```", "Example: " ++ close, close ++ " suffix", "{\"example\":\"" ++ close ++ "\"}", "<\u{ff5c}DSML\u{ff5c} calls>" ++ close, "</\u{ff5c}DSML\u{ff5c}  calls>", "</\u{ff5c}DSML\u{ff5c} calls" }) |text| try std.testing.expect(toolWarning(text) == null);
++}
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 14445263..2d7f71ab 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -1,5 +1,8 @@
+ //! The server: one engine and tokenizer behind the HTTP routes, one thread a connection.
+ const std = @import("std");
++
++/// A kept-alive connection keeps at most this much of its request arena between requests.
++pub const connection_arena_limit: usize = 1 << 20;
+ const api = @import("engine_api");
+ const json = @import("json.zig");
+ const errors = @import("errors.zig");
+@@ -291,7 +294,7 @@ pub const Server = struct {
+         var arena: std.heap.ArenaAllocator = .init(srv.gpa);
+         defer arena.deinit();
+         while (true) {
+-            _ = arena.reset(.retain_capacity);
++            _ = arena.reset(.{ .retain_with_limit = connection_arena_limit });
+             const a = arena.allocator();
+             const outcome = conn.readRequest(a, true) catch break;
+             switch (outcome) {
+diff --git a/zig/src/server/tool_grammar.zig b/zig/src/server/tool_grammar.zig
+index 1551b277..ea0e454b 100644
+--- a/zig/src/server/tool_grammar.zig
++++ b/zig/src/server/tool_grammar.zig
+@@ -218,9 +218,8 @@ test "a DSML grammar holds every call in one block, each invoke's parameters in
+ }
+ 
+ test "a forced DSML call's marker is its token: spelled in plain characters, the reply's parameter never closes; with the ban the token follows \"<\"" {
+-    // opt-in, as the test below: TF_GRAMMAR_DIR, TF_GRAMMAR_TEMPLATE, TF_GRAMMAR_VOCAB, TF_GRAMMAR_STOP and libtfgrammar
++    // opt-in, as the test below: TF_GRAMMAR_DIR, TF_GRAMMAR_VOCAB, TF_GRAMMAR_STOP and libtfgrammar
+     const dir = std.testing.environ.getPosix("TF_GRAMMAR_DIR") orelse return error.SkipZigTest;
+-    const template = std.testing.environ.getPosix("TF_GRAMMAR_TEMPLATE") orelse return error.SkipZigTest;
+     const vocab = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_VOCAB") orelse return error.SkipZigTest, 10);
+     const stop = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_STOP") orelse return error.SkipZigTest, 10);
+     const gpa = std.testing.allocator;
+@@ -229,7 +228,7 @@ test "a forced DSML call's marker is its token: spelled in plain characters, the
+     defer arena.deinit();
+     const a = arena.allocator();
+     var problem: []const u8 = "";
+-    const hf = try @import("hf_text.zig").HfText.load(gpa, io, dir, template, a, &problem);
++    const hf = try @import("hf_text.zig").HfText.load(gpa, io, dir, a, &problem);
+     defer hf.deinit();
+     const text = hf.text();
+     const tok = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "tokenizer.json" }), a, .limited(256 << 20));
+@@ -248,7 +247,13 @@ test "a forced DSML call's marker is its token: spelled in plain characters, the
+     // the reply a sampled forced call wrote on the served lane ("Hello there.", temperature 1): the markers in plain
+     // characters, the closing tags with two spaces; the grammar takes all of it as the parameter's value, never the end
+     const reply = "<" ++ marker ++ " calls>\n<" ++ marker ++ " invoke name=\"get_weather\">\n<" ++ marker ++ " parameter name=\"city\" string=\"true\">London</" ++ marker ++ "  parameter>\n</" ++ marker ++ "  invoke>\n</" ++ marker ++ "  calls> \n\nHello! How can I help you today?";
+-    const plain = try text.encodePlain(a, reply);
++    // Borrow the tokenizer model and vocabulary; only this copy loses added-token
++    // matching. Keep model.added_only so BPE cannot reintroduce special tokens.
++    // Do not deinit the borrowed copy: hf still owns every allocation.
++    var plain_tokenizer = hf.tok;
++    plain_tokenizer.raw = .{};
++    plain_tokenizer.normalized = .{};
++    const plain = try plain_tokenizer.encode(a, reply);
+     try std.testing.expect(std.mem.indexOfScalar(u32, plain, dsml) == null and std.mem.indexOfScalar(u32, plain, bar[0]) != null);
+     const w = try walk(&c, io, g, plain, stop);
+     try std.testing.expect(w.taken == plain.len and !w.ended);
+@@ -289,10 +294,9 @@ fn walk(c: *api.grammar.Compiler, io: std.Io, grammar_text: []const u8, ids: []c
+ 
+ test "DSML grammars through libtfgrammar, a checkpoint's tokenizer and its template: the template's calls end at the stop; prose, an unoffered name, a missing or mistyped parameter and a second call when single do not" {
+     // opt-in: TF_GRAMMAR_DIR=<a DeepSeek-V4.1 checkpoint folder: tokenizer.json, tokenizer_config.json, config.json>
+-    // TF_GRAMMAR_TEMPLATE=<its chat template> TF_GRAMMAR_VOCAB=<its logits' width> TF_GRAMMAR_STOP=<its eos id>, and
++    // Its template is loaded from that folder. TF_GRAMMAR_VOCAB=<its logits' width> TF_GRAMMAR_STOP=<its eos id>, and
+     // libtfgrammar where the loader finds it
+     const dir = std.testing.environ.getPosix("TF_GRAMMAR_DIR") orelse return error.SkipZigTest;
+-    const template = std.testing.environ.getPosix("TF_GRAMMAR_TEMPLATE") orelse return error.SkipZigTest;
+     const vocab = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_VOCAB") orelse return error.SkipZigTest, 10);
+     const stop = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_STOP") orelse return error.SkipZigTest, 10);
+     const gpa = std.testing.allocator;
+@@ -301,7 +305,7 @@ test "DSML grammars through libtfgrammar, a checkpoint's tokenizer and its templ
+     defer arena.deinit();
+     const a = arena.allocator();
+     var problem: []const u8 = "";
+-    const hf = try @import("hf_text.zig").HfText.load(gpa, io, dir, template, a, &problem);
++    const hf = try @import("hf_text.zig").HfText.load(gpa, io, dir, a, &problem);
+     defer hf.deinit();
+     const text = hf.text();
+     const tok = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "tokenizer.json" }), a, .limited(256 << 20));
